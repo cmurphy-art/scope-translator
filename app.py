@@ -1,20 +1,27 @@
+# Scope Translator V17 (Quota-Aware / One Call Per Page)
+
 import streamlit as st
 import pdfplumber
 import google.generativeai as genai
 import json
 import re
+import hashlib
 import time
 
-# --- CONFIGURATION ---
-st.set_page_config(layout="wide", page_title="Scope Translator V15 (Debug)")
+# ------------------------------------------------------------
+# CONFIGURATION
+# ------------------------------------------------------------
+st.set_page_config(layout="wide", page_title="Scope Translator V17 (Quota-Aware)")
 
 if "GOOGLE_API_KEY" in st.secrets:
     genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
 else:
-    st.error("CRITICAL: Google API Key missing. Add it to Streamlit Secrets.")
+    st.error("CRITICAL: Google API Key missing.")
     st.stop()
 
-# --- THE SAFE LIBRARY ---
+# ------------------------------------------------------------
+# RESPONSE TEMPLATES (PUPPET MASTER)
+# ------------------------------------------------------------
 RESPONSE_TEMPLATES = {
     "UNDEFINED_BOUNDARY": {
         "category": "Common Clarification Area",
@@ -58,36 +65,25 @@ RESPONSE_TEMPLATES = {
     }
 }
 
-# --- UTILITIES ---
-
-def normalize_text(text):
-    if not text: return ""
-    return re.sub(r'\s+', ' ', text.strip().lower())
-
-def split_text_into_chunks(text, max_chars=2000):
-    chunks = []
-    current_chunk = ""
-    paragraphs = text.split('\n\n')
-    for para in paragraphs:
-        if len(current_chunk) + len(para) < max_chars:
-            current_chunk += para + "\n\n"
-        else:
-            if current_chunk: chunks.append(current_chunk)
-            current_chunk = para + "\n\n"
-    if current_chunk: chunks.append(current_chunk)
-    return chunks
-
+# ------------------------------------------------------------
+# MODEL PICKER
+# ------------------------------------------------------------
 def get_best_available_model():
     try:
-        available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        # Prefer Pro for reliability in free tier
-        if "models/gemini-1.5-flash" in available_models: return "models/gemini-1.5-flash"
-        if "models/gemini-pro" in available_models: return "models/gemini-pro"
-        return available_models[0]
+        available = [
+            m.name for m in genai.list_models()
+            if "generateContent" in m.supported_generation_methods
+        ]
+        for m in ["models/gemini-2.5-flash", "models/gemini-1.5-flash", "models/gemini-pro"]:
+            if m in available:
+                return m
+        return available[0] if available else "models/gemini-pro"
     except:
         return "models/gemini-pro"
 
-# --- THE BRAIN ---
+# ------------------------------------------------------------
+# STRICT CLASSIFIER PROMPT
+# ------------------------------------------------------------
 SYSTEM_INSTRUCTION = """
 ROLE: You are a strict Classifier. You DO NOT write text. You only select keys.
 
@@ -95,7 +91,7 @@ TASK: Analyze the text snippet. Identify specific ambiguities using the KEYS bel
 
 KEYS:
 1. UNDEFINED_BOUNDARY (Triggers: "match existing", "tie into", "patch", "repair")
-2. SUBJECTIVE_QUALITY (Triggers: "industry standard", "workmanlike", "satisfaction of") 
+2. SUBJECTIVE_QUALITY (Triggers: "industry standard", "workmanlike", "satisfaction of")
 3. UNDEFINED_SCOPE (Triggers: "turnkey", "complete system", "including but not limited to")
 4. EXPLICIT_LIABILITY (Triggers: "liquidated damages", "time is of the essence", "indemnify")
 5. COORDINATION_GAP (Triggers: "coordinate with", "verify in field", "by others")
@@ -106,140 +102,180 @@ KEYS:
 CONSTRAINTS:
 - Return ONLY a raw JSON list.
 - Extract the EXACT quote.
-- Do NOT provide reasoning. Only provide the "classification" KEY.
-- IGNORE performance verbs like "optimize", "maximize".
+- Do NOT provide reasoning.
+- IGNORE performance verbs like "optimize", "maximize", "ensure".
 - Return [] if nothing found.
 
 OUTPUT FORMAT:
 [{"trigger_text": "...", "classification": "UNDEFINED_BOUNDARY"}]
 """
 
+# ------------------------------------------------------------
+# NORMALIZATION / VALIDATION
+# ------------------------------------------------------------
 def clean_json_text(text):
-    text = re.sub(r'```json\s*', '', text)
-    text = re.sub(r'```', '', text)
+    text = re.sub(r"```json\s*", "", text)
+    text = re.sub(r"```", "", text)
     return text.strip()
 
+def safe_load_json(text):
+    try:
+        return json.loads(clean_json_text(text))
+    except:
+        return []
+
+def normalize_text(text):
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+def generate_id(page, key, quote):
+    raw = f"p{page}|{key}|{normalize_text(quote)}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+# ------------------------------------------------------------
+# PRE-SCAN (SAVES DAILY QUOTA)
+# ------------------------------------------------------------
+TRIGGER_PATTERNS = [
+    r"\bmatch existing\b", r"\btie into\b", r"\bpatch\b", r"\brepair\b",
+    r"\bindustry standard\b", r"\bworkmanlike\b", r"\bsatisfaction of\b",
+    r"\bturnkey\b", r"\bcomplete system\b", r"\bincluding but not limited to\b",
+    r"\bliquidated damages\b", r"\btime is of the essence\b", r"\bindemnify\b",
+    r"\bcoordinate with\b", r"\bverify in field\b", r"\bby others\b",
+    r"\bif possible\b", r"\bwhere possible\b", r"\bif feasible\b",
+    r"\bas needed\b", r"\bas required\b", r"\bas necessary\b",
+    r"\brequired upgrades\b", r"\bbring to code\b", r"\bcode upgrades\b",
+]
+
+TRIGGER_RE = re.compile("|".join(TRIGGER_PATTERNS), flags=re.IGNORECASE)
+
+def page_has_triggers(text):
+    return bool(TRIGGER_RE.search(text or ""))
+
+# ------------------------------------------------------------
+# GEMINI CALL WITH BACKOFF (BURST PROTECTION ONLY)
+# ------------------------------------------------------------
+def generate_with_retry(model, prompt, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            return model.generate_content(prompt)
+        except Exception as e:
+            if "429" in str(e):
+                time.sleep(6 * (2 ** attempt))
+                continue
+            raise
+    raise RuntimeError("Retry limit exceeded")
+
+# ------------------------------------------------------------
+# SCAN ENGINE (ONE CALL PER PAGE)
+# ------------------------------------------------------------
 def scan_document(pages_data):
     findings = []
-    seen_hashes = set()
-    progress_bar = st.progress(0)
-    
-    active_model = get_best_available_model()
-    # st.write(f"DEBUG: Using Model {active_model}") # Uncomment to see model name
-    model = genai.GenerativeModel(active_model)
-    
+    seen = set()
+
+    model_name = get_best_available_model()
+    model = genai.GenerativeModel(
+        model_name,
+        generation_config={"temperature": 0.0, "top_p": 0.1, "max_output_tokens": 1024}
+    )
+
+    progress = st.progress(0)
     total_pages = len(pages_data)
-    
-    for i, page_obj in enumerate(pages_data):
-        page_num = page_obj['page']
-        raw_text = page_obj['text']
-        progress_bar.progress((i + 1) / total_pages)
-        
-        chunks = split_text_into_chunks(raw_text)
-        
-        for chunk in chunks:
-            if len(chunk.strip()) < 10: continue
 
-            try:
-                # Rate Limit Protection
-                time.sleep(0.5) 
-                
-                full_prompt = f"{SYSTEM_INSTRUCTION}\n\nTEXT TO ANALYZE:\n{chunk}"
-                response = model.generate_content(full_prompt)
-                
-                # Try to parse
-                try:
-                    data = json.loads(clean_json_text(response.text))
-                except:
-                    # If JSON fails, it might be an empty response or markdown
-                    # st.warning(f"JSON Parse Error on Page {page_num}")
-                    continue
-                
-                if data:
-                    for item in data:
-                        key = item.get("classification")
-                        quote = item.get("trigger_text")
-                        
-                        if not quote: continue
+    for i, page in enumerate(pages_data):
+        progress.progress((i + 1) / max(total_pages, 1))
 
-                        # Validation Check
-                        norm_quote = normalize_text(quote)
-                        norm_chunk = normalize_text(chunk)
-                        
-                        if norm_quote not in norm_chunk:
-                            # st.warning(f"Hallucination blocked: {quote}") 
-                            continue
+        page_num = page["page"]
+        text = page["text"]
 
-                        unique_id = f"{page_num}-{norm_quote}-{key}"
-                        if unique_id in seen_hashes:
-                            continue
-                        
-                        if key in RESPONSE_TEMPLATES:
-                            template = RESPONSE_TEMPLATES[key]
-                            seen_hashes.add(unique_id)
-                            findings.append({
-                                "phrase": quote,  
-                                "category": template["category"], 
-                                "gap": template["gap"], 
-                                "question": template["question"], 
-                                "page": page_num
-                            })
-                            
-            except Exception as e:
-                # LOUD FAILURE MODE
-                st.error(f"Error processing Page {page_num}: {str(e)}")
-                
-    progress_bar.empty()
+        if not page_has_triggers(text):
+            continue
+
+        prompt = f"{SYSTEM_INSTRUCTION}\n\nTEXT TO ANALYZE:\n{text}"
+
+        try:
+            response = generate_with_retry(model, prompt)
+            data = safe_load_json(response.text)
+        except Exception as e:
+            if "quota" in str(e).lower():
+                st.error("Daily Gemini quota reached. Stop and retry after reset.")
+                break
+            continue
+
+        norm_page = normalize_text(text)
+
+        for item in data or []:
+            key = item.get("classification")
+            quote = item.get("trigger_text")
+
+            if key not in RESPONSE_TEMPLATES or not quote:
+                continue
+
+            if normalize_text(quote) not in norm_page:
+                continue
+
+            uid = generate_id(page_num, key, quote)
+            if uid in seen:
+                continue
+            seen.add(uid)
+
+            tpl = RESPONSE_TEMPLATES[key]
+            findings.append({
+                "phrase": quote,
+                "category": tpl["category"],
+                "gap": tpl["gap"],
+                "question": tpl["question"],
+                "page": page_num
+            })
+
+    progress.empty()
     return findings
 
-# --- UI ---
-st.title("Scope Translator V15 (Debug)") 
-st.markdown("**Ethos:** Strict, neutral analysis.")
+# ------------------------------------------------------------
+# UI
+# ------------------------------------------------------------
+st.title("Scope Translator V17 (Quota-Aware)")
+st.markdown("**Ethos:** One Gemini call per page. Neutral, document-centered analysis.")
 st.divider()
 
 col1, col2 = st.columns([1.5, 1])
 
 with col1:
-    st.subheader("1. Source Document")
-    uploaded_file = st.file_uploader("Upload Scope PDF", type="pdf")
-    
-    pages_data = [] 
-    full_text_display = ""
+    uploaded = st.file_uploader("Upload Scope PDF", type="pdf")
+    pages_data = []
+    display_text = ""
 
-    if uploaded_file is not None:
-        with pdfplumber.open(uploaded_file) as pdf:
+    if uploaded:
+        with pdfplumber.open(uploaded) as pdf:
             for i, page in enumerate(pdf.pages):
                 words = page.extract_words(x_tolerance=1)
-                page_text = ' '.join([w['text'] for w in words])
-                page_text = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', page_text)
-                
-                if page_text:
-                    pages_data.append({'page': i+1, 'text': page_text})
-                    full_text_display += f"--- Page {i+1} ---\n{page_text}\n\n"
-        
-        st.text_area("Extracted Text Content", full_text_display, height=600)
+                text = " ".join(w["text"] for w in words)
+                text = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", text)
+                if text:
+                    pages_data.append({"page": i + 1, "text": text})
+                    display_text += f"--- Page {i+1} ---\n{text}\n\n"
+
+        st.text_area("Extracted Text", display_text, height=600)
 
 with col2:
-    st.subheader("2. Analysis")
-    
-    if "findings" not in st.session_state:
-        st.session_state.findings = None
-
     if pages_data:
+        st.caption(
+            f"Estimated Gemini calls this run: "
+            f"{sum(1 for p in pages_data if page_has_triggers(p['text']))}"
+        )
+
         if st.button("Run Strict Analysis"):
-            with st.spinner("Analyzing..."):
-                st.session_state.findings = scan_document(pages_data)
-        
-        if st.session_state.findings:
-            results = st.session_state.findings
-            st.info(f"**Scan Complete.** Found {len(results)} items.")
-            
+            with st.spinner("Analyzing (Quota-Aware)..."):
+                st.session_state.results = scan_document(pages_data)
+
+        results = st.session_state.get("results")
+        if results is not None:
+            st.info(f"Scan complete. Found {len(results)} items.")
             for item in results:
-                with st.container():
-                    st.markdown(f"### 🔹 {item['category']}") 
-                    st.caption(f"**Found:** \"{item['phrase']}\" [Page {item['page']}]")
-                    st.markdown(f"**Gap:** {item['gap']}")
-                    st.markdown(f"**Clarification:** {item['question']}")
-                    st.divider()
+                st.markdown(f"### 🔹 {item['category']}")
+                st.caption(f"Found: \"{item['phrase']}\" [Page {item['page']}]")
+                st.markdown(f"**Gap:** {item['gap']}")
+                st.markdown(f"**Clarification:** {item['question']}")
+                st.divider()
     else:
         st.write("Upload a document to begin.")
