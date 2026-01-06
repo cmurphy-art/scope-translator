@@ -3,10 +3,9 @@ import pdfplumber
 import json
 import re
 import time
-from typing import List, Literal
+from typing import List, Literal, Optional
 
 from openai import OpenAI
-from pydantic import BaseModel
 
 # -----------------------------
 # CONFIG
@@ -20,7 +19,7 @@ if "OPENAI_API_KEY" not in st.secrets:
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 # -----------------------------
-# SAFE RESPONSE TEMPLATES
+# SAFE LIBRARY (Puppet Master)
 # -----------------------------
 RESPONSE_TEMPLATES = {
     "UNDEFINED_BOUNDARY": {
@@ -65,7 +64,7 @@ RESPONSE_TEMPLATES = {
     }
 }
 
-CLASS_KEYS = Literal[
+ClassificationKey = Literal[
     "UNDEFINED_BOUNDARY",
     "SUBJECTIVE_QUALITY",
     "UNDEFINED_SCOPE",
@@ -76,192 +75,232 @@ CLASS_KEYS = Literal[
     "REQUIRED_UPGRADES",
 ]
 
-# -----------------------------
-# STRUCTURED OUTPUT SCHEMA (Pydantic)
-# -----------------------------
-class Finding(BaseModel):
-    trigger_text: str
-    classification: CLASS_KEYS
+# Pre-scan triggers to avoid pointless API calls
+TRIGGERS = {
+    "UNDEFINED_BOUNDARY": ["match existing", "tie into", "patch", "patching", "repair"],
+    "SUBJECTIVE_QUALITY": ["industry standard", "workmanlike", "satisfaction of"],
+    "UNDEFINED_SCOPE": ["turnkey", "complete system", "including but not limited to"],
+    "EXPLICIT_LIABILITY": ["liquidated damages", "time is of the essence", "indemnify"],
+    "COORDINATION_GAP": ["coordinate with", "verify in field", "by others"],
+    "IF_POSSIBLE": ["if possible", "where possible", "if feasible"],
+    "AS_NEEDED": ["as needed", "as required", "as necessary"],
+    "REQUIRED_UPGRADES": ["required upgrades", "bring to code", "code upgrades", "upgrade", "upgrades"],
+}
 
-class FindingsPayload(BaseModel):
-    items: List[Finding]
+ALL_TRIGGER_PHRASES = sorted({p for phrases in TRIGGERS.values() for p in phrases}, key=len, reverse=True)
 
 # -----------------------------
-# PROMPT (STRICT, NEUTRAL)
+# PROMPT
 # -----------------------------
 SYSTEM_INSTRUCTION = """
-ROLE: You are a strict Classifier. You DO NOT write prose. You only output structured data.
+ROLE: You are a strict classifier.
 
-TASK: Analyze the text snippet. Identify specific ambiguities using the KEYS below.
+TASK:
+- Identify ambiguity triggers in the provided text.
+- Return ONLY a JSON array.
+- Each object must include:
+  - trigger_text: the EXACT substring copied from the input text
+  - classification: one of the allowed keys
 
-KEYS (Select best fit):
-1. UNDEFINED_BOUNDARY (Triggers: "match existing", "tie into", "patch", "repair")
-2. SUBJECTIVE_QUALITY (Triggers: "industry standard", "workmanlike", "satisfaction of")
-3. UNDEFINED_SCOPE (Triggers: "turnkey", "complete system", "including but not limited to")
-4. EXPLICIT_LIABILITY (Triggers: "liquidated damages", "time is of the essence", "indemnify")
-5. COORDINATION_GAP (Triggers: "coordinate with", "verify in field", "by others")
-6. IF_POSSIBLE (Triggers: "if possible", "where possible", "if feasible")
-7. AS_NEEDED (Triggers: "as needed", "as required", "as necessary")
-8. REQUIRED_UPGRADES (Triggers: "required upgrades", "bring to code", "code upgrades")
+ALLOWED classification KEYS:
+UNDEFINED_BOUNDARY
+SUBJECTIVE_QUALITY
+UNDEFINED_SCOPE
+EXPLICIT_LIABILITY
+COORDINATION_GAP
+IF_POSSIBLE
+AS_NEEDED
+REQUIRED_UPGRADES
 
-CONSTRAINTS:
-- Return ONLY items that appear verbatim in the snippet.
-- IGNORE performance verbs like "optimize", "maximize", "ensure".
-- If nothing found, return an empty list of items.
-
-OUTPUT:
-Return a JSON object with key "items" which is a list of {trigger_text, classification}.
+RULES:
+- Extract exact text only. No paraphrasing.
+- Do not include reasoning.
+- Ignore performance verbs like optimize, maximize, ensure.
+- Return [] if nothing found.
 """
 
 # -----------------------------
-# UTILITIES
+# TEXT UTILITIES
 # -----------------------------
-TRIGGERS_PRE_SCAN = [
-    # boundary / tie-in
-    "match existing", "tie into", "patch", "repair",
-    # subjective
-    "industry standard", "workmanlike", "satisfaction of",
-    # scope
-    "turnkey", "complete system", "including but not limited to",
-    # liability
-    "liquidated damages", "time is of the essence", "indemnify",
-    # coordination
-    "coordinate with", "verify in field", "by others",
-    # conditionals
-    "if possible", "where possible", "if feasible",
-    # as-needed
-    "as needed", "as required", "as necessary",
-    # upgrades
-    "required upgrades", "bring to code", "code upgrades",
-]
-
 def normalize_text(s: str) -> str:
     if not s:
         return ""
-    return re.sub(r"\s+", " ", s.strip().lower())
+    s = s.lower()
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
 
-def chunk_text_smart(text: str, max_chars: int = 2200) -> List[str]:
-    """
-    Works even when pdfplumber text has NO paragraph breaks.
-    Strategy:
-      1) Try split on double-newlines (real paragraphs)
-      2) Else split on sentence-ish boundaries / numbered scope items
-    """
-    t = text.strip()
-    if not t:
+def chunk_text(text: str, max_chars: int = 2400) -> List[str]:
+    text = text.strip()
+    if not text:
         return []
-
-    # If we have paragraph breaks, use them
-    if "\n\n" in t:
-        parts = t.split("\n\n")
-    else:
-        # Split on common scope patterns: "1.", "1.1", "2)", ";", ". "
-        parts = re.split(r"(?:(?<=\.)\s+|(?<=;)\s+|(?<=\))\s+|(?<=\n)\s+|(?=\b\d{1,2}\.\d{1,2}\b)|(?=\b\d{1,2}\.\b))", t)
-
+    paras = re.split(r"\n\s*\n", text)
     chunks = []
     cur = ""
-    for p in parts:
+    for p in paras:
+        p = p.strip()
         if not p:
             continue
-        if len(cur) + len(p) <= max_chars:
-            cur += (p + " ")
+        if len(cur) + len(p) + 2 <= max_chars:
+            cur = (cur + "\n\n" + p).strip() if cur else p
         else:
-            if cur.strip():
-                chunks.append(cur.strip())
-            cur = p + " "
-    if cur.strip():
-        chunks.append(cur.strip())
+            if cur:
+                chunks.append(cur)
+            cur = p
+    if cur:
+        chunks.append(cur)
     return chunks
 
-def chunk_has_triggers(chunk: str) -> bool:
-    n = normalize_text(chunk)
-    return any(normalize_text(t) in n for t in TRIGGERS_PRE_SCAN)
+def chunk_has_any_trigger(chunk: str) -> bool:
+    nc = normalize_text(chunk)
+    for phrase in ALL_TRIGGER_PHRASES:
+        if normalize_text(phrase) in nc:
+            return True
+    return False
 
-def call_model_parse(chunk: str, model: str, max_retries: int = 6) -> FindingsPayload:
+# -----------------------------
+# PDF EXTRACTION (fixes spacing)
+# -----------------------------
+def extract_page_text_linegroup(page) -> str:
     """
-    Exponential backoff on rate limits / transient errors.
+    Rebuilds readable lines by grouping words with similar 'top' (y) positions.
+    This dramatically improves spacing and hit-rate for trigger phrases.
     """
-    backoff = 1.5
+    words = page.extract_words(x_tolerance=2, y_tolerance=2, keep_blank_chars=False, use_text_flow=True)
+    if not words:
+        return ""
+
+    # Sort by y then x
+    words = sorted(words, key=lambda w: (round(w["top"], 1), w["x0"]))
+
+    lines = []
+    current_line = []
+    current_top = None
+
+    for w in words:
+        top = round(w["top"], 1)
+        if current_top is None:
+            current_top = top
+
+        # New line if y jumps
+        if abs(top - current_top) > 2.0:
+            if current_line:
+                lines.append(" ".join(current_line).strip())
+            current_line = [w["text"]]
+            current_top = top
+        else:
+            current_line.append(w["text"])
+
+    if current_line:
+        lines.append(" ".join(current_line).strip())
+
+    # Light cleanup: add space between camelCase collisions sometimes caused by PDFs
+    text = "\n".join(lines)
+    text = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", text)
+    return text.strip()
+
+# -----------------------------
+# OPENAI CALL (with backoff)
+# -----------------------------
+def call_openai_classifier(chunk: str, model_name: str, max_retries: int = 3) -> List[dict]:
+    prompt = f"{SYSTEM_INSTRUCTION}\n\nTEXT TO ANALYZE:\n{chunk}"
+
     for attempt in range(max_retries):
         try:
-            resp = client.responses.parse(
-                model=model,
+            resp = client.responses.create(
+                model=model_name,
                 input=[
                     {"role": "system", "content": SYSTEM_INSTRUCTION},
                     {"role": "user", "content": f"TEXT TO ANALYZE:\n{chunk}"},
                 ],
-                text_format=FindingsPayload,
+                text={"format": {"type": "json_object"}},
             )
-            return resp.output_parsed
-        except Exception as e:
-            msg = str(e).lower()
-            # Typical rate limit / overload signals
-            if "rate" in msg or "429" in msg or "overloaded" in msg or "temporarily" in msg:
-                sleep_s = min(20, backoff * (attempt + 1))
-                time.sleep(sleep_s)
-                continue
-            # Non-retryable: bubble up
-            raise
-    # If we ran out of retries, return empty
-    return FindingsPayload(items=[])
 
-def scan_document(pages_data, model: str):
+            # Responses API can return multiple output items. We want the final text blob.
+            out_text = ""
+            for item in resp.output:
+                if item.type == "message":
+                    for c in item.content:
+                        if c.type == "output_text":
+                            out_text += c.text
+
+            out_text = out_text.strip()
+            if not out_text:
+                return []
+
+            data = json.loads(out_text)
+            # We accept either {"items":[...]} or just [...]
+            if isinstance(data, dict) and "items" in data and isinstance(data["items"], list):
+                return data["items"]
+            if isinstance(data, list):
+                return data
+            return []
+
+        except Exception as e:
+            msg = str(e)
+            # Backoff on 429 / rate limits
+            if "429" in msg or "rate" in msg.lower():
+                time.sleep(2 ** attempt)
+                continue
+            return []
+
+    return []
+
+# -----------------------------
+# SCAN ENGINE
+# -----------------------------
+def scan_document(pages_data: List[dict], model_name: str) -> List[dict]:
     findings = []
     seen = set()
 
-    # Progress based on chunks, not pages
+    # Count chunks for progress
     all_chunks = []
     for p in pages_data:
-        chunks = chunk_text_smart(p["text"])
-        for c in chunks:
-            all_chunks.append((p["page"], c))
+        for ch in chunk_text(p["text"]):
+            if chunk_has_any_trigger(ch):
+                all_chunks.append((p["page"], ch))
 
-    total = max(1, len(all_chunks))
+    total = len(all_chunks)
     progress = st.progress(0)
+    done = 0
 
-    for idx, (page_num, chunk) in enumerate(all_chunks):
-        progress.progress((idx + 1) / total)
+    for page_num, chunk in all_chunks:
+        items = call_openai_classifier(chunk, model_name=model_name)
 
-        if len(chunk.strip()) < 20:
-            continue
+        for it in items:
+            key = it.get("classification", "")
+            quote = it.get("trigger_text", "")
 
-        # Pre-scan to reduce calls
-        if not chunk_has_triggers(chunk):
-            continue
-
-        payload = call_model_parse(chunk, model=model)
-        for item in payload.items:
-            quote = item.trigger_text
-            key = item.classification
-
+            if key not in RESPONSE_TEMPLATES:
+                continue
             if not quote:
                 continue
 
-            # Trust anchor: must appear in the chunk verbatim-ish
-            nq = normalize_text(quote)
-            nc = normalize_text(chunk)
-            if nq not in nc:
+            # Hallucination guard: exact substring (case-insensitive check)
+            if normalize_text(quote) not in normalize_text(chunk):
                 continue
 
-            unique_id = f"{page_num}|{key}|{nq}"
-            if unique_id in seen:
+            uniq = f"{page_num}|{normalize_text(quote)}|{key}"
+            if uniq in seen:
                 continue
-            seen.add(unique_id)
+            seen.add(uniq)
 
-            template = RESPONSE_TEMPLATES.get(key)
-            if not template:
-                continue
+            t = RESPONSE_TEMPLATES[key]
+            findings.append(
+                {
+                    "phrase": quote,
+                    "category": t["category"],
+                    "gap": t["gap"],
+                    "question": t["question"],
+                    "page": page_num,
+                }
+            )
 
-            findings.append({
-                "phrase": quote,
-                "category": template["category"],
-                "gap": template["gap"],
-                "question": template["question"],
-                "page": page_num,
-                "key": key
-            })
+        done += 1
+        progress.progress(min(done / max(total, 1), 1.0))
 
     progress.empty()
+    # Sort by page then category for stable output
+    findings.sort(key=lambda x: (x["page"], x["category"], x["phrase"].lower()))
     return findings
 
 # -----------------------------
@@ -283,46 +322,39 @@ with col1:
     if uploaded_file is not None:
         with pdfplumber.open(uploaded_file) as pdf:
             for i, page in enumerate(pdf.pages):
-                # Prefer extract_text; fallback to words
-                text = page.extract_text() or ""
-                text = text.strip()
-
-                if len(text) < 50:
-                    words = page.extract_words(x_tolerance=1)
-                    text = " ".join([w["text"] for w in words])
-                    text = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", text)
-
-                if text.strip():
-                    pages_data.append({"page": i + 1, "text": text})
-                    full_text_display += f"--- Page {i+1} ---\n{text}\n\n"
+                page_text = extract_page_text_linegroup(page)
+                if page_text:
+                    pages_data.append({"page": i + 1, "text": page_text})
+                    full_text_display += f"--- Page {i+1} ---\n{page_text}\n\n"
 
         st.text_area("Extracted Text Content", full_text_display, height=600)
 
 with col2:
     st.subheader("2. Analysis")
 
-    if "findings" not in st.session_state:
-        st.session_state.findings = None
-
-    # Model choice: reliable first
-    model = st.selectbox(
+    # Pick a model. Default to a reliable general model.
+    model_name = st.selectbox(
         "Model",
         options=[
-            "gpt-4o-2024-08-06",
-            "gpt-4o-mini-2024-07-18",
+            "gpt-5.2",
+            "gpt-5.2-mini",
+            "gpt-4o",
+            "gpt-4o-mini",
         ],
         index=0,
-        help="4o is the most reliable/accurate. 4o-mini is cheaper/faster."
     )
+
+    if "findings" not in st.session_state:
+        st.session_state.findings = None
 
     if pages_data:
         if st.button("Run Strict Analysis"):
             with st.spinner("Applying filters..."):
-                st.session_state.findings = scan_document(pages_data, model=model)
+                st.session_state.findings = scan_document(pages_data, model_name=model_name)
 
         if st.session_state.findings is not None:
             results = st.session_state.findings
-            st.info(f"**Scan complete.** Found {len(results)} items.")
+            st.info(f"**Scan Complete.** Found {len(results)} items.")
 
             for item in results:
                 with st.container():
