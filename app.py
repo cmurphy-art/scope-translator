@@ -3,14 +3,15 @@ import pdfplumber
 import json
 import re
 import time
-from typing import List, Literal, Optional
+from dataclasses import dataclass
+from typing import List, Dict, Any
 
 from openai import OpenAI
 
-# -----------------------------
+# ----------------------------
 # CONFIG
-# -----------------------------
-st.set_page_config(layout="wide", page_title="Scope Translator (OpenAI)")
+# ----------------------------
+st.set_page_config(layout="wide", page_title="Scope Translator (OpenAI Hybrid)")
 
 if "OPENAI_API_KEY" not in st.secrets:
     st.error("CRITICAL: OPENAI_API_KEY missing. Add it to Streamlit Secrets.")
@@ -18,9 +19,12 @@ if "OPENAI_API_KEY" not in st.secrets:
 
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-# -----------------------------
-# SAFE LIBRARY (Puppet Master)
-# -----------------------------
+DEFAULT_MODEL = "gpt-4o"       # most reliable/accurate
+CHEAP_MODEL = "gpt-4o-mini"    # cheaper, still solid
+
+# ----------------------------
+# SAFE RESPONSE TEMPLATES (Neutral, document-centered)
+# ----------------------------
 RESPONSE_TEMPLATES = {
     "UNDEFINED_BOUNDARY": {
         "category": "Common Clarification Area",
@@ -64,251 +68,261 @@ RESPONSE_TEMPLATES = {
     }
 }
 
-ClassificationKey = Literal[
-    "UNDEFINED_BOUNDARY",
-    "SUBJECTIVE_QUALITY",
-    "UNDEFINED_SCOPE",
-    "EXPLICIT_LIABILITY",
-    "COORDINATION_GAP",
-    "IF_POSSIBLE",
-    "AS_NEEDED",
-    "REQUIRED_UPGRADES",
+ALLOWED_KEYS = set(RESPONSE_TEMPLATES.keys())
+
+# ----------------------------
+# TEXT NORMALIZATION & EXTRACTION
+# ----------------------------
+def normalize_text(text: str) -> str:
+    if not text:
+        return ""
+    text = text.lower()
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+def extract_page_text(page) -> str:
+    """
+    Practical extraction:
+    1) Try extract_text() (keeps some structure when possible)
+    2) Fallback to extract_words() (your "nuclear" option)
+    3) Fix glued words in a conservative way
+    """
+    txt = page.extract_text() or ""
+    txt = txt.strip()
+
+    if len(txt) < 50:
+        words = page.extract_words(x_tolerance=1)
+        txt = " ".join([w["text"] for w in words])
+
+    # Light de-glue for camelcase artifacts from word-join
+    txt = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", txt)
+
+    # Normalize whitespace
+    txt = re.sub(r"\s+", " ", txt).strip()
+    return txt
+
+# ----------------------------
+# CANDIDATE SNIPPET FINDER (broad, not brittle)
+# ----------------------------
+CANDIDATE_PATTERNS = [
+    # conditional / discretion
+    r"\b(if possible|where possible|if feasible)\b",
+    # "as needed" family
+    r"\b(as needed|as required|as necessary)\b",
+    # match/tie-in boundary
+    r"\b(match existing|to match existing|closely match existing|tie into|tie-in|patch(ing)?|repair)\b",
+    # open-ended scope
+    r"\b(turnkey|complete system|including but not limited to)\b",
+    # coordination / handoff ambiguity
+    r"\b(coordinate with|by others|verify in field)\b",
+    # explicit contractual triggers
+    r"\b(liquidated damages|time is of the essence|indemnify)\b",
+    # upgrades / code language
+    r"\b(required upgrades?|bring to code|code upgrades?)\b",
+    # placeholders / undefined scope markers
+    r"\b(TBD|T\.B\.D\.)\b",
 ]
 
-# Pre-scan triggers to avoid pointless API calls
-TRIGGERS = {
-    "UNDEFINED_BOUNDARY": ["match existing", "tie into", "patch", "patching", "repair"],
-    "SUBJECTIVE_QUALITY": ["industry standard", "workmanlike", "satisfaction of"],
-    "UNDEFINED_SCOPE": ["turnkey", "complete system", "including but not limited to"],
-    "EXPLICIT_LIABILITY": ["liquidated damages", "time is of the essence", "indemnify"],
-    "COORDINATION_GAP": ["coordinate with", "verify in field", "by others"],
-    "IF_POSSIBLE": ["if possible", "where possible", "if feasible"],
-    "AS_NEEDED": ["as needed", "as required", "as necessary"],
-    "REQUIRED_UPGRADES": ["required upgrades", "bring to code", "code upgrades", "upgrade", "upgrades"],
-}
+# Split into “snippets” without needing original PDF line breaks
+def split_into_snippets(text: str, max_len: int = 220) -> List[str]:
+    """
+    We split on punctuation and bullets-ish separators to get clause-sized text.
+    """
+    if not text:
+        return []
 
-ALL_TRIGGER_PHRASES = sorted({p for phrases in TRIGGERS.values() for p in phrases}, key=len, reverse=True)
+    rough = re.split(r"(?<=[\.\;\:\?\!])\s+|(?=\s-\s)|(?=\s•\s)|(?=\s\d+\.)", text)
+    snippets = []
+    for s in rough:
+        s = s.strip()
+        if not s:
+            continue
+        # cap length (keep front portion; enough to contain the trigger)
+        if len(s) > max_len:
+            s = s[:max_len].rstrip()
+        snippets.append(s)
+    return snippets
 
-# -----------------------------
-# PROMPT
-# -----------------------------
+def find_candidate_snippets(page_text: str, max_candidates: int = 30) -> List[str]:
+    snippets = split_into_snippets(page_text)
+    hits = []
+    for s in snippets:
+        s_norm = normalize_text(s)
+        if len(s_norm) < 8:
+            continue
+        for pat in CANDIDATE_PATTERNS:
+            if re.search(pat, s_norm, flags=re.IGNORECASE):
+                hits.append(s)
+                break
+
+    # dedupe while preserving order
+    seen = set()
+    uniq = []
+    for s in hits:
+        key = normalize_text(s)
+        if key in seen:
+            continue
+        uniq.append(s)
+        seen.add(key)
+
+    return uniq[:max_candidates]
+
+# ----------------------------
+# LLM CLASSIFIER (batched per page)
+# ----------------------------
 SYSTEM_INSTRUCTION = """
 ROLE: You are a strict classifier.
 
 TASK:
-- Identify ambiguity triggers in the provided text.
-- Return ONLY a JSON array.
-- Each object must include:
-  - trigger_text: the EXACT substring copied from the input text
-  - classification: one of the allowed keys
+You will be given a list of candidate snippets from a construction scope document.
+Return a JSON list of findings. Each finding must:
+- Choose exactly ONE classification key from the KEYS list.
+- Provide trigger_text that is an EXACT substring from the snippet (copy/paste).
+- Provide snippet_index (integer) to indicate which snippet it came from.
 
-ALLOWED classification KEYS:
-UNDEFINED_BOUNDARY
-SUBJECTIVE_QUALITY
-UNDEFINED_SCOPE
-EXPLICIT_LIABILITY
-COORDINATION_GAP
-IF_POSSIBLE
-AS_NEEDED
-REQUIRED_UPGRADES
+KEYS:
+- UNDEFINED_BOUNDARY
+- SUBJECTIVE_QUALITY
+- UNDEFINED_SCOPE
+- EXPLICIT_LIABILITY
+- COORDINATION_GAP
+- IF_POSSIBLE
+- AS_NEEDED
+- REQUIRED_UPGRADES
 
-RULES:
-- Extract exact text only. No paraphrasing.
-- Do not include reasoning.
-- Ignore performance verbs like optimize, maximize, ensure.
-- Return [] if nothing found.
+CONSTRAINTS:
+- Return ONLY valid JSON (no markdown).
+- If nothing applies, return [].
+- Do NOT invent text that isn't in the snippet.
 """
 
-# -----------------------------
-# TEXT UTILITIES
-# -----------------------------
-def normalize_text(s: str) -> str:
-    if not s:
-        return ""
-    s = s.lower()
-    s = re.sub(r"\s+", " ", s)
-    return s.strip()
+def safe_json_load(text: str) -> List[Dict[str, Any]]:
+    try:
+        return json.loads(text)
+    except:
+        # attempt to strip ``` wrappers if present
+        cleaned = re.sub(r"```json\s*|\s*```", "", text).strip()
+        try:
+            return json.loads(cleaned)
+        except:
+            return []
 
-def chunk_text(text: str, max_chars: int = 2400) -> List[str]:
-    text = text.strip()
-    if not text:
+def call_openai_classifier(model: str, snippets: List[str], max_retries: int = 3) -> List[Dict[str, Any]]:
+    if not snippets:
         return []
-    paras = re.split(r"\n\s*\n", text)
-    chunks = []
-    cur = ""
-    for p in paras:
-        p = p.strip()
-        if not p:
-            continue
-        if len(cur) + len(p) + 2 <= max_chars:
-            cur = (cur + "\n\n" + p).strip() if cur else p
-        else:
-            if cur:
-                chunks.append(cur)
-            cur = p
-    if cur:
-        chunks.append(cur)
-    return chunks
 
-def chunk_has_any_trigger(chunk: str) -> bool:
-    nc = normalize_text(chunk)
-    for phrase in ALL_TRIGGER_PHRASES:
-        if normalize_text(phrase) in nc:
-            return True
-    return False
+    payload = {
+        "snippets": [{"i": i, "text": s} for i, s in enumerate(snippets)]
+    }
 
-# -----------------------------
-# PDF EXTRACTION (fixes spacing)
-# -----------------------------
-def extract_page_text_linegroup(page) -> str:
-    """
-    Rebuilds readable lines by grouping words with similar 'top' (y) positions.
-    This dramatically improves spacing and hit-rate for trigger phrases.
-    """
-    words = page.extract_words(x_tolerance=2, y_tolerance=2, keep_blank_chars=False, use_text_flow=True)
-    if not words:
-        return ""
-
-    # Sort by y then x
-    words = sorted(words, key=lambda w: (round(w["top"], 1), w["x0"]))
-
-    lines = []
-    current_line = []
-    current_top = None
-
-    for w in words:
-        top = round(w["top"], 1)
-        if current_top is None:
-            current_top = top
-
-        # New line if y jumps
-        if abs(top - current_top) > 2.0:
-            if current_line:
-                lines.append(" ".join(current_line).strip())
-            current_line = [w["text"]]
-            current_top = top
-        else:
-            current_line.append(w["text"])
-
-    if current_line:
-        lines.append(" ".join(current_line).strip())
-
-    # Light cleanup: add space between camelCase collisions sometimes caused by PDFs
-    text = "\n".join(lines)
-    text = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", text)
-    return text.strip()
-
-# -----------------------------
-# OPENAI CALL (with backoff)
-# -----------------------------
-def call_openai_classifier(chunk: str, model_name: str, max_retries: int = 3) -> List[dict]:
-    prompt = f"{SYSTEM_INSTRUCTION}\n\nTEXT TO ANALYZE:\n{chunk}"
+    user_input = (
+        "CANDIDATE SNIPPETS (JSON):\n"
+        + json.dumps(payload, ensure_ascii=False)
+        + "\n\nReturn findings now."
+    )
 
     for attempt in range(max_retries):
         try:
             resp = client.responses.create(
-                model=model_name,
-                input=[
-                    {"role": "system", "content": SYSTEM_INSTRUCTION},
-                    {"role": "user", "content": f"TEXT TO ANALYZE:\n{chunk}"},
-                ],
-                text={"format": {"type": "json_object"}},
+                model=model,
+                instructions=SYSTEM_INSTRUCTION,
+                input=user_input,
+                # keep output tight
+                max_output_tokens=800,
             )
-
-            # Responses API can return multiple output items. We want the final text blob.
-            out_text = ""
-            for item in resp.output:
-                if item.type == "message":
-                    for c in item.content:
-                        if c.type == "output_text":
-                            out_text += c.text
-
-            out_text = out_text.strip()
-            if not out_text:
-                return []
-
-            data = json.loads(out_text)
-            # We accept either {"items":[...]} or just [...]
-            if isinstance(data, dict) and "items" in data and isinstance(data["items"], list):
-                return data["items"]
-            if isinstance(data, list):
-                return data
-            return []
-
+            data = safe_json_load(resp.output_text)
+            if isinstance(data, dict):
+                data = [data]
+            return data if isinstance(data, list) else []
         except Exception as e:
             msg = str(e)
-            # Backoff on 429 / rate limits
-            if "429" in msg or "rate" in msg.lower():
+            # simple exponential backoff on rate/overload
+            if "429" in msg or "rate" in msg.lower() or "overload" in msg.lower():
                 time.sleep(2 ** attempt)
                 continue
-            return []
+            # otherwise: fail fast for visibility
+            raise
 
     return []
 
-# -----------------------------
-# SCAN ENGINE
-# -----------------------------
-def scan_document(pages_data: List[dict], model_name: str) -> List[dict]:
+# ----------------------------
+# MAIN SCAN
+# ----------------------------
+def scan_document(pages_data: List[Dict[str, Any]], model_name: str) -> List[Dict[str, Any]]:
     findings = []
     seen = set()
 
-    # Count chunks for progress
-    all_chunks = []
-    for p in pages_data:
-        for ch in chunk_text(p["text"]):
-            if chunk_has_any_trigger(ch):
-                all_chunks.append((p["page"], ch))
+    progress_bar = st.progress(0)
+    total_pages = len(pages_data)
 
-    total = len(all_chunks)
-    progress = st.progress(0)
-    done = 0
+    for idx, page_obj in enumerate(pages_data):
+        page_num = page_obj["page"]
+        page_text = page_obj["text"]
 
-    for page_num, chunk in all_chunks:
-        items = call_openai_classifier(chunk, model_name=model_name)
+        progress_bar.progress((idx + 1) / max(total_pages, 1))
 
-        for it in items:
-            key = it.get("classification", "")
-            quote = it.get("trigger_text", "")
+        candidates = find_candidate_snippets(page_text, max_candidates=35)
 
-            if key not in RESPONSE_TEMPLATES:
+        # If nothing even looks ambiguous, skip API entirely
+        if not candidates:
+            continue
+
+        llm_items = call_openai_classifier(model_name, candidates)
+
+        for item in llm_items:
+            key = (item.get("classification") or "").strip()
+            trig = (item.get("trigger_text") or "").strip()
+            snip_i = item.get("snippet_index")
+
+            if key not in ALLOWED_KEYS:
                 continue
-            if not quote:
+            if trig == "" or snip_i is None:
+                continue
+            if not (0 <= int(snip_i) < len(candidates)):
                 continue
 
-            # Hallucination guard: exact substring (case-insensitive check)
-            if normalize_text(quote) not in normalize_text(chunk):
+            snippet = candidates[int(snip_i)]
+
+            # Trust anchor: must be exact substring of snippet
+            if normalize_text(trig) not in normalize_text(snippet):
                 continue
 
-            uniq = f"{page_num}|{normalize_text(quote)}|{key}"
-            if uniq in seen:
+            # Dedup: page + normalized trigger + key
+            uid = f"{page_num}|{normalize_text(trig)}|{key}"
+            if uid in seen:
                 continue
-            seen.add(uniq)
+            seen.add(uid)
 
-            t = RESPONSE_TEMPLATES[key]
-            findings.append(
-                {
-                    "phrase": quote,
-                    "category": t["category"],
-                    "gap": t["gap"],
-                    "question": t["question"],
-                    "page": page_num,
-                }
-            )
+            tpl = RESPONSE_TEMPLATES[key]
+            findings.append({
+                "category": tpl["category"],
+                "phrase": trig,
+                "gap": tpl["gap"],
+                "question": tpl["question"],
+                "page": page_num,
+            })
 
-        done += 1
-        progress.progress(min(done / max(total, 1), 1.0))
+    progress_bar.empty()
 
-    progress.empty()
-    # Sort by page then category for stable output
-    findings.sort(key=lambda x: (x["page"], x["category"], x["phrase"].lower()))
+    # sort by page, then category for readability
+    findings.sort(key=lambda x: (x["page"], x["category"]))
     return findings
 
-# -----------------------------
+# ----------------------------
 # UI
-# -----------------------------
-st.title("Scope Translator (OpenAI)")
+# ----------------------------
+st.title("Scope Translator (OpenAI Hybrid)")
 st.markdown("**Ethos:** Move the burden from the person to the document.")
 st.divider()
+
+with st.sidebar:
+    st.subheader("Model")
+    model_choice = st.selectbox(
+        "Choose model",
+        options=[DEFAULT_MODEL, CHEAP_MODEL],
+        index=0
+    )
+    st.caption("Use gpt-4o for best accuracy. Use gpt-4o-mini for cheaper runs.")
 
 col1, col2 = st.columns([1.5, 1])
 
@@ -322,7 +336,7 @@ with col1:
     if uploaded_file is not None:
         with pdfplumber.open(uploaded_file) as pdf:
             for i, page in enumerate(pdf.pages):
-                page_text = extract_page_text_linegroup(page)
+                page_text = extract_page_text(page)
                 if page_text:
                     pages_data.append({"page": i + 1, "text": page_text})
                     full_text_display += f"--- Page {i+1} ---\n{page_text}\n\n"
@@ -332,29 +346,17 @@ with col1:
 with col2:
     st.subheader("2. Analysis")
 
-    # Pick a model. Default to a reliable general model.
-    model_name = st.selectbox(
-        "Model",
-        options=[
-            "gpt-5.2",
-            "gpt-5.2-mini",
-            "gpt-4o",
-            "gpt-4o-mini",
-        ],
-        index=0,
-    )
-
     if "findings" not in st.session_state:
         st.session_state.findings = None
 
     if pages_data:
-        if st.button("Run Strict Analysis"):
-            with st.spinner("Applying filters..."):
-                st.session_state.findings = scan_document(pages_data, model_name=model_name)
+        if st.button("Run Analysis"):
+            with st.spinner("Applying filters and classifying candidates..."):
+                st.session_state.findings = scan_document(pages_data, model_choice)
 
         if st.session_state.findings is not None:
             results = st.session_state.findings
-            st.info(f"**Scan Complete.** Found {len(results)} items.")
+            st.info(f"**Scan complete.** Found {len(results)} items.")
 
             for item in results:
                 with st.container():
