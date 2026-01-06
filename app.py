@@ -6,14 +6,12 @@ import re
 
 # --- CONFIGURATION: THE BRAIN ---
 
-# Configure Gemini using the Secret Key from Streamlit
+# Configure Gemini using the Secret Key
 if "GOOGLE_API_KEY" in st.secrets:
     genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
 else:
-    st.error("Missing Google API Key. Please add it to Streamlit Secrets.")
+    st.error("CRITICAL ERROR: Google API Key is missing from Secrets.")
 
-# The Safety System Prompt (Layer 2)
-# This controls the "Personality" of the AI.
 SYSTEM_INSTRUCTION = """
 ROLE: You are a strict Scope Analyzer for construction documents. 
 You are NOT an advisor. You DO NOT write emails.
@@ -27,26 +25,19 @@ TAXONOMY:
 4. EXPLICIT_LIABILITY (Triggers: "liquidated damages", "time is of the essence", "indemnify", "hold harmless")
 5. COORDINATION_GAP (Triggers: "coordinate with", "verify in field", "by others", "provided by owner")
 
-CONSTRAINTS (NON-NEGOTIABLE):
-- You must ONLY return a raw JSON list. No markdown formatting (```json).
-- Extract the EXACT quote from the text.
-- Do NOT provide advice or predict risk (e.g., never say "this could cause delays").
-- If no ambiguity is found, return an empty list [].
+CONSTRAINTS:
+- Return ONLY a raw JSON list. 
+- NO markdown blocks (do not use ```json).
+- If no ambiguity is found, return []
 
-OUTPUT FORMAT (JSON List):
-[
-  {
-    "trigger_text": "install new vanity to match existing",
-    "classification": "UNDEFINED_BOUNDARY",
-    "reasoning": "The text requires matching but does not define the physical limit."
-  }
-]
+OUTPUT FORMAT:
+[{"trigger_text": "...", "classification": "...", "reasoning": "..."}]
 """
 
 # --- LOGIC ENGINE ---
 
 def analyze_chunk_with_gemini(text_chunk):
-    """Sends text to Gemini Flash for classification."""
+    """Sends text to Gemini Flash with ERROR REPORTING."""
     try:
         model = genai.GenerativeModel(
             model_name="gemini-1.5-flash",
@@ -54,19 +45,23 @@ def analyze_chunk_with_gemini(text_chunk):
             generation_config={"response_mime_type": "application/json"}
         )
         
-        # Send text to model
         response = model.generate_content(text_chunk)
+        
+        # DEBUG: Print raw response to console (hidden from user)
+        # print(response.text)
+        
         return json.loads(response.text)
+        
     except Exception as e:
+        # VISIBLE ERROR REPORTING
+        st.error(f"⚠️ AI ANALYST ERROR: {str(e)}")
+        # If it's a JSON error, show what the AI actually said
+        if "JSON" in str(e) and 'response' in locals():
+            st.warning(f"Raw AI Response: {response.text}")
         return []
 
 def scan_document(pages_data):
-    """
-    The Semantic Engine: Sends pages to LLM for analysis.
-    """
     findings = []
-    
-    # Progress bar (because AI takes a second)
     progress_bar = st.progress(0)
     total_pages = len(pages_data)
     
@@ -74,7 +69,6 @@ def scan_document(pages_data):
         page_num = page_obj['page']
         text = page_obj['text']
         
-        # Update progress
         progress_bar.progress((i + 1) / total_pages)
         
         # Call the LLM
@@ -95,20 +89,14 @@ def scan_document(pages_data):
 
 # --- USER INTERFACE (UI) ---
 
-st.set_page_config(layout="wide", page_title="Scope Translator (Semantic)")
+st.set_page_config(layout="wide", page_title="Scope Translator (Debug Mode)")
 
-# Header
-st.title("Scope Translator (Semantic Mode)") 
-st.markdown("""
-**Ethos:** This tool identifies undefined conditions in the scope using AI classification.
-It does not offer legal advice. It is designed to move the burden from the person to the document.
-""")
+st.title("Scope Translator (Debug Mode)") 
+st.markdown("**Ethos:** AI-Powered Scope Analysis.")
 st.divider()
 
-# Split Screen Layout
 col1, col2 = st.columns([1.5, 1])
 
-# LEFT COLUMN: The Document
 with col1:
     st.subheader("1. Source Document")
     uploaded_file = st.file_uploader("Upload Scope PDF", type="pdf")
@@ -119,7 +107,6 @@ with col1:
     if uploaded_file is not None:
         with pdfplumber.open(uploaded_file) as pdf:
             for i, page in enumerate(pdf.pages):
-                # NUCLEAR OPTION: x_tolerance=1 to fix squashed words
                 words = page.extract_words(x_tolerance=1)
                 page_text = ' '.join([w['text'] for w in words])
                 page_text = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', page_text)
@@ -130,16 +117,13 @@ with col1:
         
         st.text_area("Extracted Text Content", full_text_display, height=600)
 
-# RIGHT COLUMN: The Translator
 with col2:
     st.subheader("2. Analysis")
     
-    # Session state to keep results after button click
     if "findings" not in st.session_state:
         st.session_state.findings = None
 
     if pages_data:
-        # The Action Button (saves money/time by not auto-running)
         if st.button("Run Semantic Analysis"):
             with st.spinner("Consulting the Analyst..."):
                 st.session_state.findings = scan_document(pages_data)
@@ -150,13 +134,10 @@ with col2:
             
             for item in results:
                 with st.container():
-                    # Card Styling
                     st.markdown(f"### 🔹 {item['phrase']}")
                     st.caption(f"**Category:** {item['category']}")
-                    
                     st.markdown(f"> *\"{item['snippet']}\"*")
                     st.markdown(f"**[Page {item['page']}]**")
-                    
                     st.markdown(f"**Clarification:** {item['question']}")
                     st.divider()
     else:
