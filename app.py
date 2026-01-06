@@ -117,8 +117,8 @@ def scan_text(text):
 
 st.set_page_config(layout="wide", page_title="Prephase Scope Translator")
 
-# Header
-st.title("Scope Translator (Prototype)")
+# Header - VISUAL TRACER ADDED
+st.title("Scope Translator V2") 
 st.markdown("""
 **Ethos:** This tool identifies undefined conditions in the scope. 
 It does not offer legal advice. It is designed to move the burden from the person to the document.
@@ -137,12 +137,11 @@ with col1:
     if uploaded_file is not None:
         with pdfplumber.open(uploaded_file) as pdf:
             for page in pdf.pages:
-                # NUCLEAR OPTION FOR TEXT EXTRACTION
-                # 1. Extract words individually to guarantee separation
-                words = page.extract_words(x_tolerance=1)
+                # STRICTEST SETTING: x_tolerance=0 forces separation of anything not touching
+                words = page.extract_words(x_tolerance=0)
                 page_text = ' '.join([w['text'] for w in words])
                 
-                # 2. Regex Patch: Force space between lowercase and Uppercase (e.g. "VivianKwok" -> "Vivian Kwok")
+                # Regex Patch for CamelCase
                 page_text = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', page_text)
                 
                 if page_text:
