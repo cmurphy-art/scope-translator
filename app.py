@@ -12,159 +12,160 @@ CONTEXT_TAGS = {
     "#GENERAL_REQS": ["mobilization", "safety", "schedule", "supervision", "insurance", "permit"],
 }
 
-# FULL POWER LIBRARY (22 Triggers)
+# SMART PATTERN LIBRARY (Regex Enabled)
+# We use 'pattern' instead of 'phrase' to allow flexible matching.
 TRIGGERS = [
     {
-        "phrase": "match existing",
+        "label": "Match Existing",
+        "pattern": r"match(?:ing|es)?\s+(?:the\s+)?(?:existing|adjacent|original|new|prevailing)",
         "category": "Common Clarification Area",
-        "risk": "Undefined Physical Boundary",
         "question": "The document requires matching but does not currently define the physical boundary. Is the transition point the immediate area or the nearest corner?",
         "context_required": None
     },
     {
-        "phrase": "coordinate with",
+        "label": "Coordinate With",
+        "pattern": r"coordinat(?:e|ion)\s+(?:with|between|of)",
         "category": "Implied Responsibility",
-        "risk": "Undefined Priority",
         "question": "The scope involves multiple trades. Does the document assign priority in this zone to prevent schedule stacking?",
         "context_required": ["#MEP", "#FINISHES"]
     },
     {
-        "phrase": "industry standard",
+        "label": "Industry Standard",
+        "pattern": r"industry\s+standard",
         "category": "Implied Responsibility",
-        "risk": "Subjective Quality Metric",
         "question": "The term 'standard' is subjective. Does the contract reference a specific AWI or TCNA grade for acceptance?",
         "context_required": None
     },
     {
-        "phrase": "paint ready",
+        "label": "Paint Ready",
+        "pattern": r"(?:paint\s+ready|ready\s+for\s+paint)",
         "category": "Common Clarification Area",
-        "risk": "Ambiguous Surface Prep",
         "question": "Surface prep levels are currently undefined. Does 'paint ready' explicitly imply a Level 4 finish and primer?",
         "context_required": ["#FINISHES"]
     },
     {
-        "phrase": "field verify",
+        "label": "Field Verify",
+        "pattern": r"field\s+verify",
         "category": "Explicit Commitment",
-        "risk": "Liability for Design Errors",
         "question": "The drawings may pre-date current conditions. Does the scope provide a mechanism for adjustment if discrepancies are found?",
         "context_required": ["#STRUCTURAL", "#MEP"]
     },
     {
-        "phrase": "by others",
+        "label": "By Others",
+        "pattern": r"by\s+others",
         "category": "Implied Responsibility",
-        "risk": "Boundary Gap",
         "question": "This item relies on a third party. Is the specific hand-off date and required condition defined elsewhere?",
         "context_required": None
     },
     {
-        "phrase": "allowance for",
+        "label": "Allowance",
+        "pattern": r"allowance",
         "category": "Common Clarification Area",
-        "risk": "Budget Friction",
         "question": "An allowance is listed, but tax/labor inclusion is not specified. Are these costs included in the figure?",
         "context_required": None
     },
     {
-        "phrase": "as directed by",
+        "label": "Subjective Approval",
+        "pattern": r"(?:as\s+directed\s+by|at\s+direction\s+of)",
         "category": "Implied Responsibility",
-        "risk": "Subjective Approval",
         "question": "The specific design criteria are not currently defined. Is there a mockup or 'not-to-exceed' spec that establishes the limit?",
         "context_required": None
     },
     {
-        "phrase": "code compliant",
+        "label": "Code Compliant",
+        "pattern": r"code\s+complian(?:t|ce)",
         "category": "Common Clarification Area",
-        "risk": "Installer Liability",
         "question": "Design compliance is shifted to the installer here. Has this specific assembly been pre-vetted by the local jurisdiction?",
         "context_required": None
     },
     {
-        "phrase": "including but not limited to",
+        "label": "Open-Ended Scope",
+        "pattern": r"including\s+but\s+not\s+limited\s+to",
         "category": "Common Clarification Area",
-        "risk": "Open-Ended Scope",
         "question": "This phrase creates an indefinite scope. Is there a specific exclusion list that bounds this requirement?",
         "context_required": None
     },
     {
-        "phrase": "at no additional cost",
+        "label": "No Additional Cost",
+        "pattern": r"at\s+no\s+additional\s+cost",
         "category": "Explicit Commitment",
-        "risk": "Unlimited Liability",
         "question": "This clause creates unlimited liability for undefined items. Is there a specific scope list that bounds this cost?",
         "context_required": None
     },
     {
-        "phrase": "turnkey",
+        "label": "Turnkey",
+        "pattern": r"turnkey",
         "category": "Implied Responsibility",
-        "risk": "Undefined Scope Limits",
         "question": "The term 'turnkey' is broad. Does the document specify boundaries regarding accessories, furniture, or final cleaning?",
         "context_required": None
     },
     {
-        "phrase": "sole discretion",
+        "label": "Sole Discretion",
+        "pattern": r"sole\s+discretion",
         "category": "Common Clarification Area",
-        "risk": "Subjective Acceptance",
         "question": "This phrase removes objective criteria. Is there an industry standard (AWI/TCNA) that can serve as the neutral benchmark?",
         "context_required": None
     },
     {
-        "phrase": "satisfaction of architect",
+        "label": "Satisfaction of...",
+        "pattern": r"(?:satisfaction\s+of|satisfactory\s+to|discretion\s+of)",
         "category": "Common Clarification Area",
-        "risk": "Subjective Acceptance",
         "question": "Acceptance is currently subjective. Is there a measurable standard for 'satisfaction' that replaces personal preference?",
         "context_required": None
     },
     {
-        "phrase": "restore to original condition",
+        "label": "Restore Condition",
+        "pattern": r"restore\s+to\s+(?:original|previous)\s+condition",
         "category": "Implied Responsibility",
-        "risk": "Undefined Baseline",
         "question": "'Original condition' is subjective without a baseline. Is there a pre-construction photo report that establishes the standard?",
         "context_required": None
     },
     {
-        "phrase": "continuous supervision",
+        "label": "Continuous Supervision",
+        "pattern": r"continuous\s+supervision",
         "category": "Explicit Commitment",
-        "risk": "Resource Drain",
         "question": "'Continuous' implies a dedicated non-working role. Is this the intent, or is a working lead acceptable?",
         "context_required": None
     },
     {
-        "phrase": "liquidated damages",
+        "label": "Liquidated Damages",
+        "pattern": r"liquidated\s+damages",
         "category": "Common Clarification Area",
-        "risk": "Financial Penalty",
         "question": "Damages are listed. Does the contract also include a reciprocal bonus for early completion or excusable delays?",
         "context_required": None
     },
     {
-        "phrase": "hazardous materials",
+        "label": "Hazardous Materials",
+        "pattern": r"hazardous\s+materials?",
         "category": "Explicit Commitment",
-        "risk": "Ambiguous Liability",
         "question": "Discovery protocols are undefined. Is the builder's responsibility limited to 'stop and notify' to ensure safety?",
         "context_required": None
     },
     {
-        "phrase": "temporary protection",
+        "label": "Temporary Protection",
+        "pattern": r"temporary\s+protection",
         "category": "Implied Responsibility",
-        "risk": "Undefined Cost",
         "question": "Protection requirements are broad. Is this a specific line-item allowance, or part of general conditions?",
         "context_required": ["#GENERAL_REQS", "#FINISHES"]
     },
     {
-        "phrase": "permit fees",
+        "label": "Permit Fees",
+        "pattern": r"permit\s+fees?",
         "category": "Explicit Commitment",
-        "risk": "Cost Variance",
         "question": "Payment responsibility is unclear. Are these fees billable at cost, or included in the base contract sum?",
         "context_required": None
     },
     {
-        "phrase": "accelerated schedule",
+        "label": "Accelerated Schedule",
+        "pattern": r"accelerated\s+schedule",
         "category": "Common Clarification Area",
-        "risk": "Premium Labor Costs",
         "question": "The schedule implies pace beyond standard hours. Does the base bid include overtime premiums, or are those separate?",
         "context_required": None
     },
     {
-        "phrase": "time is of the essence",
+        "label": "Time is of the Essence",
+        "pattern": r"time\s+is\s+of\s+the\s+essence",
         "category": "Common Clarification Area",
-        "risk": "Legal Exposure",
         "question": "This converts delays to breach. Does the contract account for excusable delays such as weather or supply chain?",
         "context_required": None
     }
@@ -183,8 +184,7 @@ def determine_context(text_block):
 
 def scan_text(pages_data):
     """
-    The Deterministic Engine: Scans text for triggers based on rules.
-    Now accepts a list of page objects to track page numbers.
+    The Smart Pattern Engine: Scans text for Regex patterns.
     """
     findings = []
     
@@ -201,10 +201,12 @@ def scan_text(pages_data):
             # 1. Identify Context
             tags = determine_context(para)
             
-            # 2. Check Triggers
+            # 2. Check Triggers using Regex
             for trigger in TRIGGERS:
-                if trigger["phrase"] in para.lower():
-                    
+                # re.search allows for fuzzy matching based on the pattern
+                match = re.search(trigger["pattern"], para, re.IGNORECASE)
+                
+                if match:
                     # Context Rule Check
                     if trigger["context_required"]:
                         if not any(t in tags for t in trigger["context_required"]):
@@ -216,9 +218,9 @@ def scan_text(pages_data):
 
                     # Record finding with Page Number
                     findings.append({
-                        "phrase": trigger["phrase"],
+                        "phrase": trigger["label"], # Use label for clean UI
                         "category": trigger["category"],
-                        "risk": trigger["risk"],
+                        "risk": "Risk Detected", # Generic placeholder, UI uses question
                         "question": trigger["question"],
                         "snippet": para[:200] + "...",
                         "page": page_num
@@ -227,10 +229,10 @@ def scan_text(pages_data):
 
 # --- USER INTERFACE (UI) ---
 
-st.set_page_config(layout="wide", page_title="Scope Translator Full Power")
+st.set_page_config(layout="wide", page_title="Scope Translator Smart Mode")
 
 # Header
-st.title("Scope Translator (Full Power)") 
+st.title("Scope Translator (Smart Mode)") 
 st.markdown("""
 **Ethos:** This tool identifies undefined conditions in the scope. 
 It does not offer legal advice. It is designed to move the burden from the person to the document.
@@ -251,12 +253,12 @@ with col1:
     if uploaded_file is not None:
         with pdfplumber.open(uploaded_file) as pdf:
             for i, page in enumerate(pdf.pages):
-                # NUCLEAR OPTION FOR TEXT EXTRACTION
-                # 1. Force word separation
-                words = page.extract_words(x_tolerance=0)
+                # TUNED EXTRACTION: x_tolerance=1
+                # This fixes "Primar y" while still keeping separate words apart.
+                words = page.extract_words(x_tolerance=1)
                 page_text = ' '.join([w['text'] for w in words])
                 
-                # 2. Regex Patch for CamelCase (VivianKwok -> Vivian Kwok)
+                # Regex Patch for CamelCase
                 page_text = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', page_text)
                 
                 if page_text:
@@ -281,7 +283,7 @@ with col2:
         for item in results:
             with st.container():
                 # Card Styling - Neutral Icon
-                st.markdown(f"### 🔹 {item['phrase'].title()}")
+                st.markdown(f"### 🔹 {item['phrase']}")
                 st.caption(f"**Category:** {item['category']}")
                 
                 # The "Tether" (Quote) with Citation
