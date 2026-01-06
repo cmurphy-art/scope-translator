@@ -4,102 +4,151 @@ import google.generativeai as genai
 import json
 import re
 
-st.set_page_config(layout="wide", page_title="Scope Translator (Diagnostic)")
-st.title("Scope Translator: Diagnostic Mode")
+# --- CONFIGURATION ---
+st.set_page_config(layout="wide", page_title="Scope Translator (Semantic)")
 
-# --- STEP 1: VERIFY API KEY ---
 if "GOOGLE_API_KEY" in st.secrets:
-    api_key = st.secrets["GOOGLE_API_KEY"]
-    # Show first 4 chars to prove it loaded (securely)
-    st.success(f"API Key loaded from Secrets (starts with: `{api_key[:4]}...`)")
-    genai.configure(api_key=api_key)
+    genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
 else:
-    st.error("CRITICAL: No API Key found in Streamlit Secrets.")
+    st.error("CRITICAL: Google API Key missing. Add it to Streamlit Secrets.")
     st.stop()
 
-# --- STEP 2: CHECK AVAILABLE MODELS ---
-st.subheader("1. Connectivity & Model Test")
-active_model_name = None
-
-try:
-    with st.spinner("Pinging Google AI to find available models..."):
-        # Ask Google which models this key can access
-        available_models = []
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                available_models.append(m.name)
-        
-        st.write("Models available to your key:", available_models)
-        
-        # Auto-select the best one found
-        if "models/gemini-1.5-flash" in available_models:
-            active_model_name = "models/gemini-1.5-flash"
-        elif "models/gemini-pro" in available_models:
-            active_model_name = "models/gemini-pro"
-        elif available_models:
-            active_model_name = available_models[0]
-            
-        if active_model_name:
-            st.success(f"✅ Connection Successful! Using model: **{active_model_name}**")
-        else:
-            st.error("❌ Connection worked, but no text generation models are available to this key.")
-            st.stop()
-
-except Exception as e:
-    st.error(f"❌ Connection Failed: {e}")
-    st.info("Check your API Key in 'Secrets' for extra spaces or missing quotes.")
-    st.stop()
-
-# --- STEP 3: THE SCANNER ---
-st.subheader("2. Document Scan")
-uploaded_file = st.file_uploader("Upload Scope PDF", type="pdf")
-
-if uploaded_file and st.button("Run Diagnostic Scan"):
-    
-    # Extract Text (Nuclear Option)
-    full_text = ""
-    with pdfplumber.open(uploaded_file) as pdf:
-        for page in pdf.pages:
-            words = page.extract_words(x_tolerance=1)
-            text = ' '.join([w['text'] for w in words])
-            full_text += text + "\n"
-    
-    st.write(f"**Document Read:** Extracted {len(full_text)} characters.")
-    
-    # The Prompt
-    SYSTEM_PROMPT = """
-    You are a construction scope analyzer. Find ambiguities.
-    
-    TAXONOMY:
-    1. UNDEFINED_BOUNDARY (e.g. "match existing")
-    2. SUBJECTIVE_QUALITY (e.g. "industry standard")
-    3. UNDEFINED_SCOPE (e.g. "turnkey", "complete system")
-    
-    OUTPUT: Return ONLY a raw JSON list. Example:
-    [{"trigger_text": "match existing", "classification": "UNDEFINED_BOUNDARY", "reasoning": "..."}]
-    """
-    
-    final_prompt = f"{SYSTEM_PROMPT}\n\nDOCUMENT CONTENT:\n{full_text[:10000]}" # Limit to first 10k chars for speed
-    
-    # Send to AI
+# --- THE AUTO-PILOT (Crucial for preventing 404 errors) ---
+def get_best_available_model():
+    """Finds the best model your key has access to."""
     try:
-        st.info("Sending text to AI Analyst...")
-        model = genai.GenerativeModel(active_model_name)
-        response = model.generate_content(final_prompt)
+        available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
         
-        # SHOW THE RAW OUTPUT (This is what we need to see!)
-        st.subheader("3. Raw AI Response (Debug View)")
-        st.code(response.text)
+        # Priority list (Newest/Fastest first)
+        preferred_order = [
+            "models/gemini-2.5-flash",
+            "models/gemini-1.5-flash", 
+            "models/gemini-pro",
+        ]
         
-        # Attempt to Parse
-        clean_json = re.sub(r'```json|```', '', response.text).strip()
-        data = json.loads(clean_json)
+        for model in preferred_order:
+            if model in available_models:
+                return model
         
-        st.subheader("4. Processed Findings")
-        for item in data:
-            st.markdown(f"**🔹 {item.get('trigger_text')}**")
-            st.caption(item.get('reasoning'))
-            st.divider()
+        # Fallback to whatever is available
+        return available_models[0] if available_models else None
+    except:
+        return "models/gemini-pro" # Blind fallback
+
+# --- THE BRAIN ---
+SYSTEM_INSTRUCTION = """
+ROLE: You are a strict Scope Analyzer for construction documents.
+TASK: Analyze the text snippet. Identify specific ambiguities using the TAXONOMY below.
+
+TAXONOMY:
+1. UNDEFINED_BOUNDARY (Triggers: "match existing", "tie into", "if possible", "as required")
+2. SUBJECTIVE_QUALITY (Triggers: "industry standard", "workmanlike", "satisfaction of", "best practice")
+3. UNDEFINED_SCOPE (Triggers: "turnkey", "including but not limited to", "complete system")
+4. EXPLICIT_LIABILITY (Triggers: "liquidated damages", "time is of the essence", "indemnify")
+5. COORDINATION_GAP (Triggers: "coordinate with", "verify in field", "by others")
+
+CONSTRAINTS:
+- Return ONLY a raw JSON list.
+- Extract the EXACT quote.
+- Do NOT provide advice.
+- Return [] if nothing found.
+
+OUTPUT FORMAT:
+[{"trigger_text": "...", "classification": "...", "reasoning": "..."}]
+"""
+
+def clean_json_text(text):
+    text = re.sub(r'```json\s*', '', text)
+    text = re.sub(r'```', '', text)
+    return text.strip()
+
+def scan_document(pages_data):
+    findings = []
+    progress_bar = st.progress(0)
+    
+    # Select Model Dynamically
+    active_model = get_best_available_model()
+    model = genai.GenerativeModel(active_model)
+    
+    total_pages = len(pages_data)
+    
+    for i, page_obj in enumerate(pages_data):
+        page_num = page_obj['page']
+        text = page_obj['text']
+        
+        progress_bar.progress((i + 1) / total_pages)
+        
+        try:
+            full_prompt = f"{SYSTEM_INSTRUCTION}\n\nTEXT TO ANALYZE:\n{text}"
+            response = model.generate_content(full_prompt)
             
-    except Exception as e:
-        st.error(f"Processing Error: {e}")
+            data = json.loads(clean_json_text(response.text))
+            
+            if data:
+                for item in data:
+                    findings.append({
+                        "phrase": item.get("classification", "Ambiguity").replace("_", " ").title(),
+                        "category": "Detected by Semantic Analyst", 
+                        "question": item.get("reasoning", "Clarification required."),
+                        "snippet": item.get("trigger_text", "See text..."),
+                        "page": page_num
+                    })
+        except Exception as e:
+            print(f"Page {page_num} Error: {e}")
+            continue
+                
+    progress_bar.empty()
+    return findings
+
+# --- USER INTERFACE ---
+st.title("Scope Translator (Semantic Mode)") 
+st.markdown("**Ethos:** This tool uses AI to identify undefined conditions. It moves the burden from the person to the document.")
+st.divider()
+
+col1, col2 = st.columns([1.5, 1])
+
+with col1:
+    st.subheader("1. Source Document")
+    uploaded_file = st.file_uploader("Upload Scope PDF", type="pdf")
+    
+    pages_data = [] 
+    full_text_display = ""
+
+    if uploaded_file is not None:
+        with pdfplumber.open(uploaded_file) as pdf:
+            for i, page in enumerate(pdf.pages):
+                words = page.extract_words(x_tolerance=1)
+                page_text = ' '.join([w['text'] for w in words])
+                page_text = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', page_text)
+                
+                if page_text:
+                    pages_data.append({'page': i+1, 'text': page_text})
+                    full_text_display += f"--- Page {i+1} ---\n{page_text}\n\n"
+        
+        st.text_area("Extracted Text Content", full_text_display, height=600)
+
+with col2:
+    st.subheader("2. Analysis")
+    
+    if "findings" not in st.session_state:
+        st.session_state.findings = None
+
+    if pages_data:
+        if st.button("Run Semantic Analysis"):
+            with st.spinner("Consulting the Analyst..."):
+                st.session_state.findings = scan_document(pages_data)
+        
+        if st.session_state.findings:
+            results = st.session_state.findings
+            st.info(f"**Scan Complete.** Found {len(results)} items requiring clarification.")
+            
+            for item in results:
+                with st.container():
+                    st.markdown(f"### 🔹 {item['phrase']}")
+                    st.caption(f"**Category:** {item['category']}")
+                    st.markdown(f"> *\"{item['snippet']}\"*")
+                    st.markdown(f"**[Page {item['page']}]**")
+                    st.markdown(f"**Clarification:** {item['question']}")
+                    st.divider()
+    else:
+        st.write("Upload a document to begin.")
