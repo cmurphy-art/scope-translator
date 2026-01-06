@@ -12,7 +12,7 @@ CONTEXT_TAGS = {
     "#GENERAL_REQS": ["mobilization", "safety", "schedule", "supervision", "insurance", "permit"],
 }
 
-# FULL LIBRARY (22 Triggers)
+# FULL POWER LIBRARY (22 Triggers)
 TRIGGERS = [
     {
         "phrase": "match existing",
@@ -227,10 +227,10 @@ def scan_text(pages_data):
 
 # --- USER INTERFACE (UI) ---
 
-st.set_page_config(layout="wide", page_title="Prephase Scope Translator")
+st.set_page_config(layout="wide", page_title="Scope Translator Full Power")
 
 # Header
-st.title("Scope Translator V3") 
+st.title("Scope Translator (Full Power)") 
 st.markdown("""
 **Ethos:** This tool identifies undefined conditions in the scope. 
 It does not offer legal advice. It is designed to move the burden from the person to the document.
@@ -252,8 +252,11 @@ with col1:
         with pdfplumber.open(uploaded_file) as pdf:
             for i, page in enumerate(pdf.pages):
                 # NUCLEAR OPTION FOR TEXT EXTRACTION
+                # 1. Force word separation
                 words = page.extract_words(x_tolerance=0)
                 page_text = ' '.join([w['text'] for w in words])
+                
+                # 2. Regex Patch for CamelCase (VivianKwok -> Vivian Kwok)
                 page_text = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', page_text)
                 
                 if page_text:
