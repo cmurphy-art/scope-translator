@@ -1,20 +1,27 @@
 import streamlit as st
 import pdfplumber
-import google.generativeai as genai
 import json
 import re
 import time
+from typing import List, Literal
 
-# --- CONFIGURATION ---
-st.set_page_config(layout="wide", page_title="Scope Translator V14.1 (Quota + Shape Safe)")
+from openai import OpenAI
+from pydantic import BaseModel
 
-if "GOOGLE_API_KEY" in st.secrets:
-    genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
-else:
-    st.error("CRITICAL: Google API Key missing. Add it to Streamlit Secrets.")
+# -----------------------------
+# CONFIG
+# -----------------------------
+st.set_page_config(layout="wide", page_title="Scope Translator (OpenAI)")
+
+if "OPENAI_API_KEY" not in st.secrets:
+    st.error("CRITICAL: OPENAI_API_KEY missing. Add it to Streamlit Secrets.")
     st.stop()
 
-# --- THE SAFE LIBRARY ---
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+
+# -----------------------------
+# SAFE RESPONSE TEMPLATES
+# -----------------------------
 RESPONSE_TEMPLATES = {
     "UNDEFINED_BOUNDARY": {
         "category": "Common Clarification Area",
@@ -58,90 +65,38 @@ RESPONSE_TEMPLATES = {
     }
 }
 
-# --- UTILITIES ---
+CLASS_KEYS = Literal[
+    "UNDEFINED_BOUNDARY",
+    "SUBJECTIVE_QUALITY",
+    "UNDEFINED_SCOPE",
+    "EXPLICIT_LIABILITY",
+    "COORDINATION_GAP",
+    "IF_POSSIBLE",
+    "AS_NEEDED",
+    "REQUIRED_UPGRADES",
+]
 
-def normalize_text(text):
-    """Lower + collapse whitespace for robust substring checks."""
-    if not text:
-        return ""
-    return re.sub(r"\s+", " ", text.strip().lower())
+# -----------------------------
+# STRUCTURED OUTPUT SCHEMA (Pydantic)
+# -----------------------------
+class Finding(BaseModel):
+    trigger_text: str
+    classification: CLASS_KEYS
 
-def split_text_into_chunks(text, max_chars=2000):
-    """Chunk by paragraphs first to keep context."""
-    chunks = []
-    current = ""
-    parts = text.split("\n\n")
-    for p in parts:
-        if len(current) + len(p) + 2 <= max_chars:
-            current += p + "\n\n"
-        else:
-            if current.strip():
-                chunks.append(current)
-            current = p + "\n\n"
-    if current.strip():
-        chunks.append(current)
-    return chunks
+class FindingsPayload(BaseModel):
+    items: List[Finding]
 
-def get_best_available_model():
-    """Prefer Flash, fallback to Pro."""
-    try:
-        available = [m.name for m in genai.list_models() if "generateContent" in m.supported_generation_methods]
-        for m in ["models/gemini-2.5-flash", "models/gemini-1.5-flash", "models/gemini-pro"]:
-            if m in available:
-                return m
-        return available[0] if available else "models/gemini-pro"
-    except:
-        return "models/gemini-pro"
-
-def clean_json_text(text):
-    text = re.sub(r"```json\s*", "", text)
-    text = re.sub(r"```", "", text)
-    return text.strip()
-
-def safe_load_json(text):
-    try:
-        return json.loads(clean_json_text(text))
-    except:
-        return None
-
-def call_with_backoff(model, prompt, max_retries=4):
-    """
-    Quota-safe call:
-    - If we hit 429, wait for the suggested retry delay if present, otherwise exponential backoff.
-    - Returns response.text or None.
-    """
-    base_sleep = 2.0
-    for attempt in range(max_retries + 1):
-        try:
-            resp = model.generate_content(prompt)
-            return resp.text
-        except Exception as e:
-            msg = str(e)
-
-            if "429" not in msg:
-                # Non-quota error: surface once, then stop retrying
-                raise
-
-            # Try to parse "retry in Xs" from the error string
-            m = re.search(r"retry (?:in|after)\s+([0-9.]+)\s*s", msg, re.IGNORECASE)
-            if m:
-                wait_s = float(m.group(1)) + 0.5
-            else:
-                wait_s = min(30.0, base_sleep * (2 ** attempt))
-
-            time.sleep(wait_s)
-
-    return None
-
-# --- THE BRAIN ---
+# -----------------------------
+# PROMPT (STRICT, NEUTRAL)
+# -----------------------------
 SYSTEM_INSTRUCTION = """
-ROLE: You are a strict Classifier. You DO NOT write text. You only select keys.
+ROLE: You are a strict Classifier. You DO NOT write prose. You only output structured data.
 
 TASK: Analyze the text snippet. Identify specific ambiguities using the KEYS below.
 
-KEYS:
+KEYS (Select best fit):
 1. UNDEFINED_BOUNDARY (Triggers: "match existing", "tie into", "patch", "repair")
-2. SUBJECTIVE_QUALITY (Triggers: "industry standard", "workmanlike", "satisfaction of") 
+2. SUBJECTIVE_QUALITY (Triggers: "industry standard", "workmanlike", "satisfaction of")
 3. UNDEFINED_SCOPE (Triggers: "turnkey", "complete system", "including but not limited to")
 4. EXPLICIT_LIABILITY (Triggers: "liquidated damages", "time is of the essence", "indemnify")
 5. COORDINATION_GAP (Triggers: "coordinate with", "verify in field", "by others")
@@ -150,143 +105,170 @@ KEYS:
 8. REQUIRED_UPGRADES (Triggers: "required upgrades", "bring to code", "code upgrades")
 
 CONSTRAINTS:
-- Return ONLY a raw JSON list.
-- Extract the EXACT quote.
-- Do NOT provide reasoning. Only provide the "classification" KEY.
+- Return ONLY items that appear verbatim in the snippet.
 - IGNORE performance verbs like "optimize", "maximize", "ensure".
-- Return [] if nothing found.
+- If nothing found, return an empty list of items.
 
-OUTPUT FORMAT:
-[{"trigger_text": "...", "classification": "UNDEFINED_BOUNDARY"}]
+OUTPUT:
+Return a JSON object with key "items" which is a list of {trigger_text, classification}.
 """
 
-def scan_document(pages_data):
+# -----------------------------
+# UTILITIES
+# -----------------------------
+TRIGGERS_PRE_SCAN = [
+    # boundary / tie-in
+    "match existing", "tie into", "patch", "repair",
+    # subjective
+    "industry standard", "workmanlike", "satisfaction of",
+    # scope
+    "turnkey", "complete system", "including but not limited to",
+    # liability
+    "liquidated damages", "time is of the essence", "indemnify",
+    # coordination
+    "coordinate with", "verify in field", "by others",
+    # conditionals
+    "if possible", "where possible", "if feasible",
+    # as-needed
+    "as needed", "as required", "as necessary",
+    # upgrades
+    "required upgrades", "bring to code", "code upgrades",
+]
+
+def normalize_text(s: str) -> str:
+    if not s:
+        return ""
+    return re.sub(r"\s+", " ", s.strip().lower())
+
+def chunk_text_smart(text: str, max_chars: int = 2200) -> List[str]:
+    """
+    Works even when pdfplumber text has NO paragraph breaks.
+    Strategy:
+      1) Try split on double-newlines (real paragraphs)
+      2) Else split on sentence-ish boundaries / numbered scope items
+    """
+    t = text.strip()
+    if not t:
+        return []
+
+    # If we have paragraph breaks, use them
+    if "\n\n" in t:
+        parts = t.split("\n\n")
+    else:
+        # Split on common scope patterns: "1.", "1.1", "2)", ";", ". "
+        parts = re.split(r"(?:(?<=\.)\s+|(?<=;)\s+|(?<=\))\s+|(?<=\n)\s+|(?=\b\d{1,2}\.\d{1,2}\b)|(?=\b\d{1,2}\.\b))", t)
+
+    chunks = []
+    cur = ""
+    for p in parts:
+        if not p:
+            continue
+        if len(cur) + len(p) <= max_chars:
+            cur += (p + " ")
+        else:
+            if cur.strip():
+                chunks.append(cur.strip())
+            cur = p + " "
+    if cur.strip():
+        chunks.append(cur.strip())
+    return chunks
+
+def chunk_has_triggers(chunk: str) -> bool:
+    n = normalize_text(chunk)
+    return any(normalize_text(t) in n for t in TRIGGERS_PRE_SCAN)
+
+def call_model_parse(chunk: str, model: str, max_retries: int = 6) -> FindingsPayload:
+    """
+    Exponential backoff on rate limits / transient errors.
+    """
+    backoff = 1.5
+    for attempt in range(max_retries):
+        try:
+            resp = client.responses.parse(
+                model=model,
+                input=[
+                    {"role": "system", "content": SYSTEM_INSTRUCTION},
+                    {"role": "user", "content": f"TEXT TO ANALYZE:\n{chunk}"},
+                ],
+                text_format=FindingsPayload,
+            )
+            return resp.output_parsed
+        except Exception as e:
+            msg = str(e).lower()
+            # Typical rate limit / overload signals
+            if "rate" in msg or "429" in msg or "overloaded" in msg or "temporarily" in msg:
+                sleep_s = min(20, backoff * (attempt + 1))
+                time.sleep(sleep_s)
+                continue
+            # Non-retryable: bubble up
+            raise
+    # If we ran out of retries, return empty
+    return FindingsPayload(items=[])
+
+def scan_document(pages_data, model: str):
     findings = []
     seen = set()
 
-    # Optional pacing: keep it light, let backoff handle true 429s
-    per_call_pause_s = 0.25
+    # Progress based on chunks, not pages
+    all_chunks = []
+    for p in pages_data:
+        chunks = chunk_text_smart(p["text"])
+        for c in chunks:
+            all_chunks.append((p["page"], c))
 
-    active_model = get_best_available_model()
-    model = genai.GenerativeModel(active_model)
+    total = max(1, len(all_chunks))
+    progress = st.progress(0)
 
-    progress_bar = st.progress(0)
-    total_chunks = sum(len(split_text_into_chunks(p["text"])) for p in pages_data) or 1
-    done_chunks = 0
+    for idx, (page_num, chunk) in enumerate(all_chunks):
+        progress.progress((idx + 1) / total)
 
-    # Debug counters (shown in UI)
-    parse_failures = 0
-    shape_failures = 0
-    invalid_items = 0
-    quote_misses = 0
-    quota_retries = 0
+        if len(chunk.strip()) < 20:
+            continue
 
-    for page_obj in pages_data:
-        page_num = page_obj["page"]
-        raw_text = page_obj["text"]
+        # Pre-scan to reduce calls
+        if not chunk_has_triggers(chunk):
+            continue
 
-        chunks = split_text_into_chunks(raw_text)
+        payload = call_model_parse(chunk, model=model)
+        for item in payload.items:
+            quote = item.trigger_text
+            key = item.classification
 
-        for chunk in chunks:
-            chunk = chunk.strip()
-            if len(chunk) < 10:
-                done_chunks += 1
-                progress_bar.progress(min(done_chunks / total_chunks, 1.0))
+            if not quote:
                 continue
 
-            full_prompt = f"{SYSTEM_INSTRUCTION}\n\nTEXT TO ANALYZE:\n{chunk}"
+            # Trust anchor: must appear in the chunk verbatim-ish
+            nq = normalize_text(quote)
+            nc = normalize_text(chunk)
+            if nq not in nc:
+                continue
 
-            # Pace slightly
-            time.sleep(per_call_pause_s)
+            unique_id = f"{page_num}|{key}|{nq}"
+            if unique_id in seen:
+                continue
+            seen.add(unique_id)
 
-            try:
-                out_text = None
-                try:
-                    out_text = call_with_backoff(model, full_prompt, max_retries=4)
-                except Exception as e:
-                    # Surface unexpected errors
-                    st.error(f"Error on Page {page_num}: {str(e)}")
-                    done_chunks += 1
-                    progress_bar.progress(min(done_chunks / total_chunks, 1.0))
-                    continue
+            template = RESPONSE_TEMPLATES.get(key)
+            if not template:
+                continue
 
-                if not out_text:
-                    done_chunks += 1
-                    progress_bar.progress(min(done_chunks / total_chunks, 1.0))
-                    continue
+            findings.append({
+                "phrase": quote,
+                "category": template["category"],
+                "gap": template["gap"],
+                "question": template["question"],
+                "page": page_num,
+                "key": key
+            })
 
-                raw = safe_load_json(out_text)
-                if raw is None:
-                    parse_failures += 1
-                    done_chunks += 1
-                    progress_bar.progress(min(done_chunks / total_chunks, 1.0))
-                    continue
-
-                # SHAPE FIX: dict -> list
-                if isinstance(raw, dict):
-                    raw = [raw]
-
-                if not isinstance(raw, list):
-                    shape_failures += 1
-                    done_chunks += 1
-                    progress_bar.progress(min(done_chunks / total_chunks, 1.0))
-                    continue
-
-                norm_chunk = normalize_text(chunk)
-
-                for item in raw:
-                    if not isinstance(item, dict):
-                        invalid_items += 1
-                        continue
-
-                    key = (item.get("classification") or "").strip()
-                    quote = (item.get("trigger_text") or "").strip()
-
-                    if not key or not quote:
-                        invalid_items += 1
-                        continue
-
-                    # Trust anchor: quote must exist in the chunk
-                    norm_quote = normalize_text(quote)
-                    if norm_quote not in norm_chunk:
-                        quote_misses += 1
-                        continue
-
-                    template = RESPONSE_TEMPLATES.get(key)
-                    if not template:
-                        invalid_items += 1
-                        continue
-
-                    unique_id = f"{page_num}|{key}|{norm_quote}"
-                    if unique_id in seen:
-                        continue
-                    seen.add(unique_id)
-
-                    findings.append({
-                        "phrase": quote,
-                        "category": template["category"],
-                        "gap": template["gap"],
-                        "question": template["question"],
-                        "page": page_num
-                    })
-
-            finally:
-                done_chunks += 1
-                progress_bar.progress(min(done_chunks / total_chunks, 1.0))
-
-    progress_bar.empty()
-
-    # Minimal debug visibility (optional)
-    st.caption(
-        f"Debug: parse_fail={parse_failures} | shape_fail={shape_failures} | "
-        f"invalid_items={invalid_items} | quote_miss={quote_misses}"
-    )
-
+    progress.empty()
     return findings
 
-# --- UI ---
-st.title("Scope Translator V14.1 (Quota + Shape Safe)")
-st.markdown("**Ethos:** This tool identifies undefined conditions using strict, pre-defined neutral language.")
+# -----------------------------
+# UI
+# -----------------------------
+st.title("Scope Translator (OpenAI)")
+st.markdown("**Ethos:** Move the burden from the person to the document.")
 st.divider()
 
 col1, col2 = st.columns([1.5, 1])
@@ -301,13 +283,18 @@ with col1:
     if uploaded_file is not None:
         with pdfplumber.open(uploaded_file) as pdf:
             for i, page in enumerate(pdf.pages):
-                words = page.extract_words(x_tolerance=1)
-                page_text = " ".join([w["text"] for w in words])
-                page_text = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", page_text)
+                # Prefer extract_text; fallback to words
+                text = page.extract_text() or ""
+                text = text.strip()
 
-                if page_text.strip():
-                    pages_data.append({"page": i + 1, "text": page_text})
-                    full_text_display += f"--- Page {i+1} ---\n{page_text}\n\n"
+                if len(text) < 50:
+                    words = page.extract_words(x_tolerance=1)
+                    text = " ".join([w["text"] for w in words])
+                    text = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", text)
+
+                if text.strip():
+                    pages_data.append({"page": i + 1, "text": text})
+                    full_text_display += f"--- Page {i+1} ---\n{text}\n\n"
 
         st.text_area("Extracted Text Content", full_text_display, height=600)
 
@@ -317,14 +304,25 @@ with col2:
     if "findings" not in st.session_state:
         st.session_state.findings = None
 
+    # Model choice: reliable first
+    model = st.selectbox(
+        "Model",
+        options=[
+            "gpt-4o-2024-08-06",
+            "gpt-4o-mini-2024-07-18",
+        ],
+        index=0,
+        help="4o is the most reliable/accurate. 4o-mini is cheaper/faster."
+    )
+
     if pages_data:
         if st.button("Run Strict Analysis"):
-            with st.spinner("Applying Filters..."):
-                st.session_state.findings = scan_document(pages_data)
+            with st.spinner("Applying filters..."):
+                st.session_state.findings = scan_document(pages_data, model=model)
 
         if st.session_state.findings is not None:
             results = st.session_state.findings
-            st.info(f"**Scan Complete.** Found {len(results)} items.")
+            st.info(f"**Scan complete.** Found {len(results)} items.")
 
             for item in results:
                 with st.container():
