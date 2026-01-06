@@ -6,58 +6,55 @@ import re
 
 # --- CONFIGURATION: THE BRAIN ---
 
-# Configure Gemini using the Secret Key
 if "GOOGLE_API_KEY" in st.secrets:
     genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
 else:
-    st.error("CRITICAL ERROR: Google API Key is missing from Secrets.")
+    st.error("CRITICAL ERROR: Google API Key is missing.")
 
 SYSTEM_INSTRUCTION = """
-ROLE: You are a strict Scope Analyzer for construction documents. 
-You are NOT an advisor. You DO NOT write emails.
-
-TASK: Analyze the provided text snippet. Identify if it contains specific types of ambiguity based on the TAXONOMY below.
+ROLE: You are a strict Scope Analyzer.
+TASK: Analyze the text. Return a raw JSON list of ambiguities based on the TAXONOMY.
 
 TAXONOMY:
-1. UNDEFINED_BOUNDARY (Triggers: "match existing", "tie into", "patch", "repair", "connect to", "interface with")
-2. SUBJECTIVE_QUALITY (Triggers: "industry standard", "workmanlike", "satisfaction of", "best practice", "clean and smooth")
-3. UNDEFINED_SCOPE (Triggers: "complete system", "turnkey", "including but not limited to", "necessary for", "as required")
-4. EXPLICIT_LIABILITY (Triggers: "liquidated damages", "time is of the essence", "indemnify", "hold harmless")
-5. COORDINATION_GAP (Triggers: "coordinate with", "verify in field", "by others", "provided by owner")
-
-CONSTRAINTS:
-- Return ONLY a raw JSON list. 
-- NO markdown blocks (do not use ```json).
-- If no ambiguity is found, return []
+1. UNDEFINED_BOUNDARY (e.g. "match existing", "tie into")
+2. SUBJECTIVE_QUALITY (e.g. "industry standard", "satisfaction of")
+3. UNDEFINED_SCOPE (e.g. "turnkey", "including but not limited to")
+4. EXPLICIT_LIABILITY (e.g. "liquidated damages", "time is of the essence")
+5. COORDINATION_GAP (e.g. "coordinate with", "by others")
 
 OUTPUT FORMAT:
+Return ONLY a JSON list. Do not use Markdown formatting.
+Example:
 [{"trigger_text": "...", "classification": "...", "reasoning": "..."}]
 """
 
 # --- LOGIC ENGINE ---
 
+def clean_json_text(text):
+    """Cleans the AI response to ensure it is valid JSON."""
+    # Remove markdown code blocks like ```json ... ```
+    text = re.sub(r'```json\s*', '', text)
+    text = re.sub(r'```', '', text)
+    return text.strip()
+
 def analyze_chunk_with_gemini(text_chunk):
-    """Sends text to Gemini Flash with ERROR REPORTING."""
+    """Sends text to Gemini Pro (Standard Engine)."""
     try:
-        model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
-            system_instruction=SYSTEM_INSTRUCTION,
-            generation_config={"response_mime_type": "application/json"}
-        )
+        # We use 'gemini-pro' which is the most reliable model
+        model = genai.GenerativeModel(model_name="gemini-pro")
         
-        response = model.generate_content(text_chunk)
+        # Combine system instruction with text for Gemini Pro 1.0
+        full_prompt = f"{SYSTEM_INSTRUCTION}\n\nANALYSIS TEXT:\n{text_chunk}"
         
-        # DEBUG: Print raw response to console (hidden from user)
-        # print(response.text)
+        response = model.generate_content(full_prompt)
         
-        return json.loads(response.text)
+        # Clean and Parse
+        clean_text = clean_json_text(response.text)
+        return json.loads(clean_text)
         
     except Exception as e:
-        # VISIBLE ERROR REPORTING
-        st.error(f"⚠️ AI ANALYST ERROR: {str(e)}")
-        # If it's a JSON error, show what the AI actually said
-        if "JSON" in str(e) and 'response' in locals():
-            st.warning(f"Raw AI Response: {response.text}")
+        # If it fails, we log it but keep going
+        print(f"Error: {e}")
         return []
 
 def scan_document(pages_data):
@@ -71,7 +68,6 @@ def scan_document(pages_data):
         
         progress_bar.progress((i + 1) / total_pages)
         
-        # Call the LLM
         analysis_results = analyze_chunk_with_gemini(text)
         
         if analysis_results:
@@ -89,10 +85,10 @@ def scan_document(pages_data):
 
 # --- USER INTERFACE (UI) ---
 
-st.set_page_config(layout="wide", page_title="Scope Translator (Debug Mode)")
+st.set_page_config(layout="wide", page_title="Scope Translator (Universal Mode)")
 
-st.title("Scope Translator (Debug Mode)") 
-st.markdown("**Ethos:** AI-Powered Scope Analysis.")
+st.title("Scope Translator (Universal Mode)") 
+st.markdown("**Ethos:** AI-Powered Scope Analysis (Powered by Gemini Pro).")
 st.divider()
 
 col1, col2 = st.columns([1.5, 1])
