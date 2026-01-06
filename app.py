@@ -136,10 +136,13 @@ with col1:
     uploaded_file = st.file_uploader("Upload Scope PDF", type="pdf")
     
     pdf_text = ""
-    if uploaded_file is not None:
-        with pdfplumber.open(uploaded_file) as pdf:
-            for page in pdf.pages:
-                pdf_text += page.extract_text() + "\n\n"
+        if uploaded_file is not None:
+            with pdfplumber.open(uploaded_file) as pdf:
+                for page in pdf.pages:
+                    # x_tolerance=2 helps the tool "see" spaces between words
+                    extracted = page.extract_text(x_tolerance=2)
+                    if extracted:
+                        pdf_text += extracted + "\n\n"
         
         st.text_area("Extracted Text Content", pdf_text, height=600)
 
