@@ -139,10 +139,12 @@ with col1:
         if uploaded_file is not None:
             with pdfplumber.open(uploaded_file) as pdf:
                 for page in pdf.pages:
-                    # x_tolerance=2 helps the tool "see" spaces between words
-                    extracted = page.extract_text(x_tolerance=2)
-                    if extracted:
-                        pdf_text += extracted + "\n\n"
+                    # Robust method: Extract words individually and join them
+                    words = page.extract_words()
+                    # Reconstruct text with spaces
+                    page_text = ' '.join([w['text'] for w in words])
+                    if page_text:
+                        pdf_text += page_text + "\n\n"
         
         st.text_area("Extracted Text Content", pdf_text, height=600)
 
