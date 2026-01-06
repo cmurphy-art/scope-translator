@@ -3,7 +3,6 @@ import pdfplumber
 import re
 
 # --- CONFIGURATION: THE BRAIN ---
-# This matches your Google Sheet logic exactly.
 
 CONTEXT_TAGS = {
     "#FINISHES": ["paint", "drywall", "tile", "flooring", "millwork", "cabinetry", "carpet", "baseboard", "trim"],
@@ -13,7 +12,6 @@ CONTEXT_TAGS = {
     "#GENERAL_REQS": ["mobilization", "safety", "schedule", "supervision", "insurance", "permit"],
 }
 
-# The Trigger Library (Subset for Prototype)
 TRIGGERS = [
     {
         "phrase": "match existing",
@@ -136,15 +134,19 @@ with col1:
     uploaded_file = st.file_uploader("Upload Scope PDF", type="pdf")
     
     pdf_text = ""
-        if uploaded_file is not None:
-            with pdfplumber.open(uploaded_file) as pdf:
-                for page in pdf.pages:
-                    # Robust method: Extract words individually and join them
-                    words = page.extract_words()
-                    # Reconstruct text with spaces
-                    page_text = ' '.join([w['text'] for w in words])
-                    if page_text:
-                        pdf_text += page_text + "\n\n"
+    if uploaded_file is not None:
+        with pdfplumber.open(uploaded_file) as pdf:
+            for page in pdf.pages:
+                # NUCLEAR OPTION FOR TEXT EXTRACTION
+                # 1. Extract words individually to guarantee separation
+                words = page.extract_words(x_tolerance=1)
+                page_text = ' '.join([w['text'] for w in words])
+                
+                # 2. Regex Patch: Force space between lowercase and Uppercase (e.g. "VivianKwok" -> "Vivian Kwok")
+                page_text = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', page_text)
+                
+                if page_text:
+                    pdf_text += page_text + "\n\n"
         
         st.text_area("Extracted Text Content", pdf_text, height=600)
 
