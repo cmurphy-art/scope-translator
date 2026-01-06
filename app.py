@@ -6,28 +6,23 @@ import time
 import random
 from openai import OpenAI
 
-# -----------------------------
-# CONFIG
-# -----------------------------
-st.set_page_config(layout="wide", page_title="Scope Translator (OpenAI Hybrid - Canonical)")
+# ----------------------------
+# CONFIGURATION
+# ----------------------------
+st.set_page_config(layout="wide", page_title="Scope Translator (OpenAI)")
 
-# Secrets
 if "OPENAI_API_KEY" not in st.secrets:
     st.error("CRITICAL: OPENAI_API_KEY missing. Add it to Streamlit Secrets.")
     st.stop()
 
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-# Model choice
-MODEL_OPTIONS = [
-    "gpt-4o-mini",   # fastest/cheapest, very good for this task
-    "gpt-4o",        # more accurate, higher cost
-]
-DEFAULT_MODEL = "gpt-4o-mini"
+# Choose reliability first. You can later swap to a cheaper model.
+OPENAI_MODEL = st.secrets.get("OPENAI_MODEL", "gpt-5.2")
 
-# -----------------------------
-# SAFE RESPONSE TEMPLATES (deterministic voice)
-# -----------------------------
+# ----------------------------
+# SAFE LIBRARY (Templates)
+# ----------------------------
 RESPONSE_TEMPLATES = {
     "UNDEFINED_BOUNDARY": {
         "category": "Common Clarification Area",
@@ -47,7 +42,7 @@ RESPONSE_TEMPLATES = {
     "EXPLICIT_LIABILITY": {
         "category": "Contractual Commitment",
         "gap": "The document assigns specific financial or schedule liability.",
-        "question": "Does the document account for excusable delays or reciprocal conditions?"
+        "question": "Does the contract account for excusable delays or reciprocal conditions?"
     },
     "COORDINATION_GAP": {
         "category": "Implied Responsibility",
@@ -71,274 +66,238 @@ RESPONSE_TEMPLATES = {
     }
 }
 
-ALLOWED_KEYS = set(RESPONSE_TEMPLATES.keys())
+# Optional: cheap pre-scan so you do not call the API for empty chunks
+PRE_SCAN_PHRASES = [
+    "match existing", "tie into", "patch", "repair",
+    "industry standard", "workmanlike", "satisfaction of",
+    "turnkey", "complete system", "including but not limited to",
+    "liquidated damages", "time is of the essence", "indemnify",
+    "coordinate with", "verify in field", "by others",
+    "if possible", "where possible", "if feasible",
+    "as needed", "as required", "as necessary",
+    "required upgrades", "bring to code", "code upgrades"
+]
 
-# Deterministic pre-scan triggers (include collapsed-spacing variants)
-TRIGGERS = {
-    "UNDEFINED_BOUNDARY": [
-        "match existing", "matchexisting",
-        "tie into", "tieinto",
-        "patch", "patching",
-        "repair", "repairs",
-    ],
-    "SUBJECTIVE_QUALITY": [
-        "industry standard", "industrystandard",
-        "workmanlike", "satisfaction of", "satisfactionof",
-    ],
-    "UNDEFINED_SCOPE": [
-        "turnkey", "complete system", "completesystem",
-        "including but not limited to", "includingbutnotlimitedto",
-    ],
-    "EXPLICIT_LIABILITY": [
-        "liquidated damages", "liquidateddamages",
-        "time is of the essence", "timeisoftheessence",
-        "indemnify", "indemnification",
-    ],
-    "COORDINATION_GAP": [
-        "coordinate with", "coordinatewith",
-        "verify in field", "verifyinfield",
-        "by others", "byothers",
-    ],
-    "IF_POSSIBLE": [
-        "if possible", "ifpossible",
-        "where possible", "wherepossible",
-        "if feasible", "iffeasible",
-    ],
-    "AS_NEEDED": [
-        "as needed", "asneeded",
-        "as required", "asrequired",
-        "as necessary", "asnecessary",
-    ],
-    "REQUIRED_UPGRADES": [
-        "required upgrades", "requiredupgrades",
-        "bring to code", "bringtocode",
-        "code upgrades", "codeupgrades",
-        "upgrade", "upgrades"
-    ]
-}
+SYSTEM_INSTRUCTION = """
+ROLE: You are a strict Classifier. You DO NOT write text. You only select keys.
 
-# -----------------------------
-# TEXT UTILITIES
-# -----------------------------
+TASK: Analyze the text snippet. Identify ambiguities using the KEYS below.
+
+KEYS (Select the best fit):
+1. UNDEFINED_BOUNDARY (Triggers: "match existing", "tie into", "patch", "repair")
+2. SUBJECTIVE_QUALITY (Triggers: "industry standard", "workmanlike", "satisfaction of")
+3. UNDEFINED_SCOPE (Triggers: "turnkey", "complete system", "including but not limited to")
+4. EXPLICIT_LIABILITY (Triggers: "liquidated damages", "time is of the essence", "indemnify")
+5. COORDINATION_GAP (Triggers: "coordinate with", "verify in field", "by others")
+6. IF_POSSIBLE (Triggers: "if possible", "where possible", "if feasible")
+7. AS_NEEDED (Triggers: "as needed", "as required", "as necessary")
+8. REQUIRED_UPGRADES (Triggers: "required upgrades", "bring to code", "code upgrades")
+
+CONSTRAINTS:
+- Return ONLY a raw JSON list.
+- Extract the EXACT quote as it appears in the provided text.
+- Do NOT provide reasoning. Only provide "classification" and "trigger_text".
+- Return [] if nothing found.
+
+OUTPUT FORMAT:
+[{"trigger_text": "...", "classification": "UNDEFINED_BOUNDARY"}]
+"""
+
+# ----------------------------
+# UTILITIES
+# ----------------------------
+def normalize_text(text: str) -> str:
+    if not text:
+        return ""
+    t = text.strip().lower()
+    t = re.sub(r"\s+", " ", t)
+    return t
+
 def clean_json_text(text: str) -> str:
-    text = re.sub(r"```json\s*", "", text or "")
+    if not text:
+        return "[]"
+    text = re.sub(r"```json\s*", "", text)
     text = re.sub(r"```", "", text)
     return text.strip()
 
-def norm_spaces(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip().lower())
-
-def nospace(s: str) -> str:
-    return re.sub(r"\s+", "", norm_spaces(s))
-
-def repair_spacing(s: str) -> str:
-    """
-    Attempts to fix collapsed PDF text like:
-    'December6,2024Preparedfor:VivianKwok...'
-    """
-    if not s:
-        return ""
-
-    # Insert space between letter<->digit boundaries
-    s = re.sub(r"([a-zA-Z])(\d)", r"\1 \2", s)
-    s = re.sub(r"(\d)([a-zA-Z])", r"\1 \2", s)
-
-    # Insert space after punctuation when followed by a letter
-    s = re.sub(r"([,;:])([A-Za-z])", r"\1 \2", s)
-
-    # Insert space between lower->Upper (camelCase-ish)
-    s = re.sub(r"([a-z])([A-Z])", r"\1 \2", s)
-
-    # Normalize whitespace
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-def split_text_into_chunks(text: str, max_chars: int = 2200):
-    text = text.strip()
-    if not text:
-        return []
-    # Prefer splitting on numbered items / sentences, but keep it simple + stable
-    parts = re.split(r"(\n\n+)", text)
-    chunks = []
-    cur = ""
-    for p in parts:
-        if len(cur) + len(p) <= max_chars:
-            cur += p
+def split_text_into_chunks(text: str, max_chars: int = 2000):
+    paragraphs = text.split("\n\n")
+    chunks, cur = [], ""
+    for para in paragraphs:
+        if len(cur) + len(para) + 2 <= max_chars:
+            cur += para + "\n\n"
         else:
             if cur.strip():
                 chunks.append(cur.strip())
-            cur = p
+            cur = para + "\n\n"
     if cur.strip():
         chunks.append(cur.strip())
     return chunks
 
-def chunk_has_any_trigger(chunk: str) -> bool:
-    c_space = norm_spaces(chunk)
-    c_nospace = nospace(chunk)
-    for key, variants in TRIGGERS.items():
-        for t in variants:
-            if " " in t:
-                if norm_spaces(t) in c_space:
-                    return True
-            else:
-                if t in c_nospace:
-                    return True
+def chunk_has_any_prescan_phrase(chunk: str) -> bool:
+    c = normalize_text(chunk)
+    for p in PRE_SCAN_PHRASES:
+        if p in c:
+            return True
     return False
 
-# -----------------------------
-# LLM CALL (with retry/backoff)
-# -----------------------------
-SYSTEM_INSTRUCTION = """
-ROLE: You are a strict classifier.
-You DO NOT write explanations. You only return JSON.
-
-TASK:
-Scan the provided TEXT for phrases that match the trigger families below.
-Return a JSON LIST of objects with:
-- "trigger_text": the exact phrase as it appears in the provided TEXT (copy/paste exact characters)
-- "classification": one of the KEYS below
-
-KEYS:
-UNDEFINED_BOUNDARY (match existing, tie into, patch, repair)
-SUBJECTIVE_QUALITY (industry standard, workmanlike, satisfaction of)
-UNDEFINED_SCOPE (turnkey, complete system, including but not limited to)
-EXPLICIT_LIABILITY (liquidated damages, time is of the essence, indemnify)
-COORDINATION_GAP (coordinate with, verify in field, by others)
-IF_POSSIBLE (if possible, where possible, if feasible)
-AS_NEEDED (as needed, as required, as necessary)
-REQUIRED_UPGRADES (required upgrades, bring to code, code upgrades, upgrade)
-
-CONSTRAINTS:
-- Return ONLY a raw JSON list. No markdown. No extra keys.
-- If nothing found, return [].
-"""
-
-def call_llm_for_chunk(model_name: str, chunk: str):
+def rebuild_spacing_from_words(page) -> str:
     """
-    Returns list of {"trigger_text": "...", "classification": "..."} or []
+    Rebuilds readable text using word positions.
+    This fixes the "no spacing" output for many PDFs.
     """
-    # Try a few times with exponential backoff on 429 / transient errors
-    attempts = 5
-    base_sleep = 0.8
+    words = page.extract_words(
+        x_tolerance=1,
+        y_tolerance=3,
+        keep_blank_chars=False,
+        use_text_flow=True
+    )
+    if not words:
+        return ""
 
-    for a in range(attempts):
+    # Sort by vertical then horizontal position
+    words = sorted(words, key=lambda w: (round(w["top"], 1), w["x0"]))
+
+    lines = []
+    current = []
+    current_top = None
+    prev_x1 = None
+
+    for w in words:
+        top = w["top"]
+        text = w["text"]
+
+        if current_top is None:
+            current_top = top
+
+        # New line if vertical jump is big
+        if abs(top - current_top) > 5:
+            if current:
+                lines.append("".join(current).strip())
+            current = [text]
+            current_top = top
+            prev_x1 = w["x1"]
+            continue
+
+        # Same line: insert a space if there is a visible gap
+        if prev_x1 is not None:
+            gap = w["x0"] - prev_x1
+            if gap > 2.0:
+                current.append(" ")
+        current.append(text)
+        prev_x1 = w["x1"]
+
+    if current:
+        lines.append("".join(current).strip())
+
+    page_text = "\n".join([ln for ln in lines if ln.strip()])
+
+    # Light cleanup for common stuck-together patterns
+    page_text = re.sub(r"(?<=\w)(?=[A-Z])", " ", page_text)  # aB -> a B
+    page_text = re.sub(r"(?<=\d)(?=[A-Za-z])", " ", page_text)  # 1Bathroom -> 1 Bathroom
+    page_text = re.sub(r"(?<=[A-Za-z])(?=\d)", " ", page_text)  # Bath1 -> Bath 1
+    page_text = re.sub(r"\s+", " ", page_text).replace(" \n", "\n")
+
+    # Re-introduce line breaks at obvious section dividers if they got flattened
+    page_text = page_text.replace(" __", "\n__")
+    return page_text.strip()
+
+def call_openai_classifier(text_chunk: str, max_retries: int = 4):
+    """
+    Responses API call with exponential backoff for 429 and transient failures.
+    """
+    prompt = f"{SYSTEM_INSTRUCTION}\n\nTEXT TO ANALYZE:\n{text_chunk}"
+
+    for attempt in range(max_retries):
         try:
             resp = client.responses.create(
-                model=model_name,
-                input=[
-                    {
-                        "role": "system",
-                        "content": [{"type": "input_text", "text": SYSTEM_INSTRUCTION}],
-                    },
-                    {
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": f"TEXT:\n{chunk}"}],
-                    },
-                ],
-                temperature=0,
-                max_output_tokens=600,
+                model=OPENAI_MODEL,
+                input=prompt
             )
-            text = resp.output_text
-            data = json.loads(clean_json_text(text))
+            raw = resp.output_text
+            data = json.loads(clean_json_text(raw))
             if isinstance(data, dict):
                 data = [data]
             if not isinstance(data, list):
                 return []
             return data
-
         except Exception as e:
-            msg = str(e)
-
-            # Backoff on 429 / rate limits / overloaded
-            is_rate = ("429" in msg) or ("Rate limit" in msg) or ("rate_limit" in msg)
-            is_transient = ("502" in msg) or ("503" in msg) or ("504" in msg) or ("timeout" in msg.lower())
-
-            if a < attempts - 1 and (is_rate or is_transient):
-                sleep_s = base_sleep * (2 ** a) + random.uniform(0, 0.25)
-                time.sleep(sleep_s)
-                continue
-
-            # For non-transient errors, surface it
-            raise
+            msg = str(e).lower()
+            transient = ("429" in msg) or ("rate" in msg) or ("timeout" in msg) or ("tempor" in msg) or ("overloaded" in msg)
+            if not transient or attempt == max_retries - 1:
+                return []
+            # backoff: 1.5s, 3s, 6s, 12s plus jitter
+            sleep_s = (1.5 * (2 ** attempt)) + random.uniform(0, 0.6)
+            time.sleep(sleep_s)
 
     return []
 
-# -----------------------------
-# SCAN ENGINE
-# -----------------------------
-def scan_document(pages_data, model_name: str):
+def scan_document(pages_data):
     findings = []
     seen = set()
 
-    # Progress based on estimated total chunks
-    all_chunks = []
-    for p in pages_data:
-        fixed = repair_spacing(p["text"])
-        chunks = split_text_into_chunks(fixed)
-        all_chunks.extend([(p["page"], c) for c in chunks])
-    total = max(len(all_chunks), 1)
+    total_chunks = sum(len(split_text_into_chunks(p["text"])) for p in pages_data)
+    progress = st.progress(0)
+    done = 0
 
-    progress = st.progress(0.0)
-    processed = 0
+    for page in pages_data:
+        page_num = page["page"]
+        raw_text = page["text"]
+        chunks = split_text_into_chunks(raw_text, max_chars=2000)
 
-    for page_num, chunk in all_chunks:
-        processed += 1
-        progress.progress(min(processed / total, 1.0))
-
-        if len(chunk) < 20:
-            continue
-
-        # Deterministic pre-scan (don’t waste model calls)
-        if not chunk_has_any_trigger(chunk):
-            continue
-
-        try:
-            data = call_llm_for_chunk(model_name, chunk)
-        except Exception:
-            # Fail soft: don’t kill the run
-            continue
-
-        if not data:
-            continue
-
-        for item in data:
-            key = (item or {}).get("classification", "")
-            quote = (item or {}).get("trigger_text", "")
-
-            if key not in ALLOWED_KEYS or not quote:
+        for chunk in chunks:
+            chunk = chunk.strip()
+            if len(chunk) < 20:
+                done += 1
+                progress.progress(min(done / max(total_chunks, 1), 1.0))
                 continue
 
-            # Validation that survives collapsed spacing:
-            # compare nospace(quote) in nospace(chunk)
-            if nospace(quote) not in nospace(chunk):
+            # Optional cost-control: skip obviously irrelevant chunks
+            if not chunk_has_any_prescan_phrase(chunk):
+                done += 1
+                progress.progress(min(done / max(total_chunks, 1), 1.0))
                 continue
 
-            unique_id = f"{page_num}|{key}|{nospace(quote)}"
-            if unique_id in seen:
-                continue
-            seen.add(unique_id)
+            data = call_openai_classifier(chunk)
+            if data:
+                for item in data:
+                    key = item.get("classification", "")
+                    quote = item.get("trigger_text", "")
 
-            t = RESPONSE_TEMPLATES[key]
-            findings.append(
-                {
-                    "category": t["category"],
-                    "gap": t["gap"],
-                    "question": t["question"],
-                    "phrase": quote,
-                    "page": page_num,
-                }
-            )
+                    if not key or not quote:
+                        continue
+
+                    # Trust anchor: quote must exist in chunk
+                    if normalize_text(quote) not in normalize_text(chunk):
+                        continue
+
+                    uid = f"{page_num}|{normalize_text(quote)}|{key}"
+                    if uid in seen:
+                        continue
+
+                    tpl = RESPONSE_TEMPLATES.get(key)
+                    if not tpl:
+                        continue
+
+                    seen.add(uid)
+                    findings.append({
+                        "phrase": quote,
+                        "category": tpl["category"],
+                        "gap": tpl["gap"],
+                        "question": tpl["question"],
+                        "page": page_num
+                    })
+
+            done += 1
+            progress.progress(min(done / max(total_chunks, 1), 1.0))
 
     progress.empty()
-
-    # Sort: page then category (stable + readable)
-    findings.sort(key=lambda x: (x["page"], x["category"], nospace(x["phrase"])))
     return findings
 
-# -----------------------------
+# ----------------------------
 # UI
-# -----------------------------
-st.title("Scope Translator (OpenAI Hybrid - Canonical)")
+# ----------------------------
+st.title("Scope Translator (OpenAI)")
 st.markdown("**Ethos:** Move the burden from the person to the document.")
 st.divider()
 
@@ -354,34 +313,23 @@ with col1:
     if uploaded_file is not None:
         with pdfplumber.open(uploaded_file) as pdf:
             for i, page in enumerate(pdf.pages):
-                # Prefer extract_text first (keeps natural spacing when possible)
-                text = page.extract_text() or ""
+                page_text = rebuild_spacing_from_words(page)
+                if page_text:
+                    pages_data.append({"page": i + 1, "text": page_text})
+                    full_text_display += f"--- Page {i+1} ---\n{page_text}\n\n"
 
-                # Fallback: words
-                if len(text.strip()) < 50:
-                    words = page.extract_words(x_tolerance=2, y_tolerance=2)
-                    text = " ".join([w.get("text", "") for w in words])
-
-                text = text.strip()
-                if text:
-                    pages_data.append({"page": i + 1, "text": text})
-                    fixed = repair_spacing(text)
-                    full_text_display += f"--- Page {i+1} ---\n{fixed}\n\n"
-
-        st.text_area("Extracted Text (Repaired for Spacing)", full_text_display, height=600)
+        st.text_area("Extracted Text Content", full_text_display, height=600)
 
 with col2:
     st.subheader("2. Analysis")
-
-    model_name = st.selectbox("Model", MODEL_OPTIONS, index=MODEL_OPTIONS.index(DEFAULT_MODEL))
 
     if "findings" not in st.session_state:
         st.session_state.findings = None
 
     if pages_data:
-        if st.button("Run Analysis"):
+        if st.button("Run Strict Analysis"):
             with st.spinner("Applying filters..."):
-                st.session_state.findings = scan_document(pages_data, model_name)
+                st.session_state.findings = scan_document(pages_data)
 
         if st.session_state.findings is not None:
             results = st.session_state.findings
