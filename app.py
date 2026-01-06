@@ -3,9 +3,11 @@ import pdfplumber
 import google.generativeai as genai
 import json
 import re
+import hashlib
+from collections import Counter
 
 # --- CONFIGURATION ---
-st.set_page_config(layout="wide", page_title="Scope Translator (Semantic)")
+st.set_page_config(layout="wide", page_title="Prephase Scope Translator (V11)")
 
 if "GOOGLE_API_KEY" in st.secrets:
     genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
@@ -13,96 +15,327 @@ else:
     st.error("CRITICAL: Google API Key missing. Add it to Streamlit Secrets.")
     st.stop()
 
-# --- THE AUTO-PILOT (Crucial for preventing 404 errors) ---
-def get_best_available_model():
-    """Finds the best model your key has access to."""
-    try:
-        available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        
-        # Priority list (Newest/Fastest first)
-        preferred_order = [
-            "models/gemini-2.5-flash",
-            "models/gemini-1.5-flash", 
-            "models/gemini-pro",
-        ]
-        
-        for model in preferred_order:
-            if model in available_models:
-                return model
-        
-        # Fallback to whatever is available
-        return available_models[0] if available_models else None
-    except:
-        return "models/gemini-pro" # Blind fallback
+# --- THE DOCUMENT-CENTERED LIBRARY (V11) ---
+TEMPLATE_LIBRARY = {
+    # COMMON CLARIFICATION AREA
+    "match existing": {
+        "gap": "The document requires matching but does not define the physical boundary.",
+        "question": "Does the document specify if the transition point is the immediate area or the nearest corner?"
+    },
+    "tie into": {
+        "gap": "The document requires a connection but does not define the method or extent.",
+        "question": "Does the document specify the specific point of connection and the required assembly?"
+    },
+    "turnkey": {
+        "gap": "The term 'turnkey' is used without a specific definition of scope limits.",
+        "question": "Does the document explicitly include or exclude accessories, final cleaning, and furniture?"
+    },
+    "including but not limited to": {
+        "gap": "The scope is described as open-ended.",
+        "question": "Is there a specific exclusion list that limits this requirement?"
+    },
+    "as required": {
+        "gap": "The document requires work 'as required' without a defined quantity or standard.",
+        "question": "Is there a 'not-to-exceed' quantity or specific performance standard defined?"
+    },
+    
+    # IMPLIED RESPONSIBILITY
+    "coordinate with": {
+        "gap": "The document requires coordination but does not assign priority.",
+        "question": "Does the schedule assign priority between trades to prevent stacking?"
+    },
+    "by others": {
+        "gap": "The document references work by others without defining the handoff condition.",
+        "question": "Is the specific handoff date and required condition defined?"
+    },
+    "industry standard": {
+        "gap": "The document uses a subjective quality metric.",
+        "question": "Does the contract reference a specific AWI/TCNA grade or measurable tolerance?"
+    },
+    "workmanlike": {
+        "gap": "The document uses a subjective acceptance standard.",
+        "question": "Is there a measurable standard (e.g. Level 4) for acceptance?"
+    },
 
-# --- THE BRAIN ---
+    # EXPLICIT COMMITMENT (OPERATIONAL)
+    "verify in field": {
+        "gap": "The document requires field verification. The mechanism for handling discrepancies is not specified.",
+        "question": "Does the document define the process for adjustment if field conditions differ from plans?"
+    },
+    "field measure": {
+        "gap": "The document requires field measurement. The schedule impact is not defined.",
+        "question": "Does the schedule allow time for measurement prior to fabrication?"
+    },
+    "continuous supervision": {
+        "gap": "The document requires continuous supervision. The staffing definition is not specified.",
+        "question": "Does this require a non-working superintendent, or is a working lead acceptable?"
+    },
+
+    # CONTRACTUAL COMMITMENT (LEGAL - NEUTRALIZED)
+    "liquidated damages": {
+        "gap": "A liquidated damages clause is present. The document does not specify the triggering conditions.",
+        "question": "Does the document specify the start condition, measurement method, and any stated exceptions?"
+    },
+    "time is of the essence": {
+        "gap": "The document uses strict timing language. Delay categories or exceptions are not defined in this excerpt.",
+        "question": "Does the document define any exceptions, notice requirements, or owner-caused delay handling?"
+    },
+    "indemnify": {
+        "gap": "An indemnification obligation is present. The document does not define the scope limits in this excerpt.",
+        "question": "Does the document define the scope of indemnity and any stated limits or exclusions?"
+    }
+}
+
+GENERIC_TEMPLATES = {
+    "Common Clarification Area": {
+        "gap": "A condition is listed but currently undefined.",
+        "question": "Does the document specify the exact physical boundary or standard?"
+    },
+    "Implied Responsibility": {
+        "gap": "A responsibility is implied but not detailed.",
+        "question": "Is the specific limit of this responsibility defined in the specs?"
+    },
+    "Explicit Commitment": {
+        "gap": "An operational requirement is listed. The parameters are not specified.",
+        "question": "Does the document define the specific execution requirements for this item?"
+    },
+    "Contractual Commitment": {
+        "gap": "A contractual obligation is present. The document does not specify scope limits in this excerpt.",
+        "question": "Does the document define the scope, limits, and conditions of this obligation?"
+    }
+}
+
+ALLOWED_TYPES = {
+    "Contractual Commitment",
+    "Explicit Commitment",
+    "Implied Responsibility",
+    "Common Clarification Area"
+}
+
+CATEGORY_ORDER = {
+    "Contractual Commitment": 0,
+    "Explicit Commitment": 1,
+    "Implied Responsibility": 2,
+    "Common Clarification Area": 3
+}
+
+# --- OPTIMIZATION HELPERS ---
+
+def normalize_trigger(text):
+    """For clean dictionary lookups."""
+    t = (text or "").lower().strip()
+    t = re.sub(r"\s+", " ", t)
+    t = re.sub(r"[^\w\s-]", "", t) 
+    return t
+
+# Pre-compute normalized keys for fast matching
+TEMPLATE_KEYS_NORM = [(normalize_trigger(k), v) for k, v in TEMPLATE_LIBRARY.items()]
+
+# Flat list for fast pre-scanning (Synced with Prompt)
+PRE_SCAN_TRIGGERS = list(TEMPLATE_LIBRARY.keys()) + [
+    "warrant", "guarantee", "bond", "best practice", "subject to approval", 
+    "submit daily reports"
+]
+
 SYSTEM_INSTRUCTION = """
-ROLE: You are a strict Scope Analyzer for construction documents.
-TASK: Analyze the text snippet. Identify specific ambiguities using the TAXONOMY below.
+ROLE: You are a strict Scope Auditor. 
+Your ONLY job is to extract text and classify it. You do NOT offer advice.
 
-TAXONOMY:
-1. UNDEFINED_BOUNDARY (Triggers: "match existing", "tie into", "if possible", "as required")
-2. SUBJECTIVE_QUALITY (Triggers: "industry standard", "workmanlike", "satisfaction of", "best practice")
-3. UNDEFINED_SCOPE (Triggers: "turnkey", "including but not limited to", "complete system")
-4. EXPLICIT_LIABILITY (Triggers: "liquidated damages", "time is of the essence", "indemnify")
-5. COORDINATION_GAP (Triggers: "coordinate with", "verify in field", "by others")
+TAXONOMY (STRICT):
+1. "Contractual Commitment" 
+   (Triggers: "liquidated damages", "time is of the essence", "indemnify", "warrant", "guarantee", "bond")
+   
+2. "Explicit Commitment"
+   (Triggers: "verify in field", "field measure", "continuous supervision", "submit daily reports")
 
-CONSTRAINTS:
-- Return ONLY a raw JSON list.
-- Extract the EXACT quote.
-- Do NOT provide advice.
-- Return [] if nothing found.
+3. "Implied Responsibility"
+   (Triggers: "coordinate with", "by others", "industry standard", "workmanlike", "best practice")
+   
+4. "Common Clarification Area"
+   (Triggers: "match existing", "tie into", "turnkey", "including but not limited to", "as required", "subject to approval")
 
-OUTPUT FORMAT:
-[{"trigger_text": "...", "classification": "...", "reasoning": "..."}]
+OUTPUT FORMAT (JSON ARRAY ONLY):
+[
+  {
+    "exact_quote": "Copy the text EXACTLY from the source.",
+    "finding_type": "One of the 4 Taxonomy categories above",
+    "trigger_phrase": "The specific 2-4 word phrase that triggered this (e.g. 'match existing', 'verify in field')"
+  }
+]
 """
+
+# --- LOGIC ENGINE ---
+
+def get_best_available_model():
+    try:
+        available = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        priorities = ["models/gemini-2.5-flash", "models/gemini-1.5-flash", "models/gemini-pro"]
+        for p in priorities:
+            if p in available: return p
+        return available[0] if available else "models/gemini-pro"
+    except:
+        return "models/gemini-pro"
 
 def clean_json_text(text):
     text = re.sub(r'```json\s*', '', text)
     text = re.sub(r'```', '', text)
     return text.strip()
 
+def safe_load_json(text):
+    try:
+        return json.loads(clean_json_text(text))
+    except:
+        return []
+
+def normalize_text(text):
+    """For rigorous quote matching."""
+    text = text.lower()
+    text = re.sub(r"[“”\"']", "", text)
+    text = re.sub(r"[-–—]", "-", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+def chunk_has_triggers(chunk):
+    """Fast Pre-Scan: Checks if chunk contains any triggers before calling API."""
+    norm_chunk = normalize_trigger(chunk) # Use same norm logic as triggers
+    for t in PRE_SCAN_TRIGGERS:
+        if normalize_trigger(t) in norm_chunk:
+            return True
+    return False
+
+def generate_id(finding_type, quote, page):
+    raw = f"{finding_type}|p{page}|{normalize_text(quote)}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+def apply_template(finding):
+    raw_trigger = finding.get("trigger_phrase", "")
+    trigger = normalize_trigger(raw_trigger)
+    category = finding.get("finding_type")
+    
+    # 0. Guard against empty triggers
+    if not trigger:
+        fallback = GENERIC_TEMPLATES.get(category, GENERIC_TEMPLATES["Common Clarification Area"])
+        finding["document_gap"] = fallback["gap"]
+        finding["clarification_question"] = fallback["question"]
+        return finding
+    
+    # 1. Bi-Directional Fuzzy Match using Pre-computed Keys
+    for key_norm, temp in TEMPLATE_KEYS_NORM:
+        if key_norm in trigger or trigger in key_norm:
+            finding["document_gap"] = temp["gap"]
+            finding["clarification_question"] = temp["question"]
+            return finding
+            
+    # 2. Category Fallback
+    fallback = GENERIC_TEMPLATES.get(category, GENERIC_TEMPLATES["Common Clarification Area"])
+    finding["document_gap"] = fallback["gap"]
+    finding["clarification_question"] = fallback["question"]
+            
+    return finding
+
+def chunk_text(text, chunk_size=2500):
+    paragraphs = text.split('\n\n')
+    chunks = []
+    current_chunk = ""
+    
+    if len(paragraphs) < 2:
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        for sent in sentences:
+            if len(current_chunk) + len(sent) < chunk_size:
+                current_chunk += sent + " "
+            else:
+                chunks.append(current_chunk)
+                current_chunk = sent + " "
+        if current_chunk: chunks.append(current_chunk)
+        return chunks
+
+    for para in paragraphs:
+        if len(current_chunk) + len(para) < chunk_size:
+            current_chunk += para + "\n\n"
+        else:
+            if current_chunk.strip(): chunks.append(current_chunk)
+            current_chunk = para + "\n\n"
+    
+    if current_chunk.strip():
+        chunks.append(current_chunk)
+    return chunks
+
 def scan_document(pages_data):
     findings = []
-    progress_bar = st.progress(0)
+    seen_hashes = set()
     
-    # Select Model Dynamically
     active_model = get_best_available_model()
-    model = genai.GenerativeModel(active_model)
+    model = genai.GenerativeModel(
+        active_model,
+        generation_config={
+            "temperature": 0.0, 
+            "top_p": 0.1,
+            "max_output_tokens": 1024
+        }
+    )
     
-    total_pages = len(pages_data)
+    progress_bar = st.progress(0)
+    total_steps = len(pages_data)
     
     for i, page_obj in enumerate(pages_data):
         page_num = page_obj['page']
         text = page_obj['text']
+        progress_bar.progress((i + 1) / total_steps)
         
-        progress_bar.progress((i + 1) / total_pages)
+        chunks = chunk_text(text)
         
-        try:
-            full_prompt = f"{SYSTEM_INSTRUCTION}\n\nTEXT TO ANALYZE:\n{text}"
-            response = model.generate_content(full_prompt)
+        for chunk in chunks:
+            if not chunk_has_triggers(chunk):
+                continue
+
+            # Normalize chunk for model consumption & validation
+            chunk_for_model = re.sub(r"\s+", " ", chunk).strip()
             
-            data = json.loads(clean_json_text(response.text))
-            
-            if data:
-                for item in data:
-                    findings.append({
-                        "phrase": item.get("classification", "Ambiguity").replace("_", " ").title(),
-                        "category": "Detected by Semantic Analyst", 
-                        "question": item.get("reasoning", "Clarification required."),
-                        "snippet": item.get("trigger_text", "See text..."),
-                        "page": page_num
-                    })
-        except Exception as e:
-            print(f"Page {page_num} Error: {e}")
-            continue
+            try:
+                full_prompt = f"{SYSTEM_INSTRUCTION}\n\nTEXT TO AUDIT:\n{chunk_for_model}"
+                response = model.generate_content(full_prompt)
+                
+                raw_data = safe_load_json(response.text)
+                if isinstance(raw_data, dict): raw_data = [raw_data]
+                
+                if raw_data:
+                    for item in raw_data:
+                        # 1. Type Validation
+                        ft = item.get("finding_type", "")
+                        if ft not in ALLOWED_TYPES:
+                            continue
+
+                        # 2. Quote Validation (Match against what model saw)
+                        quote = item.get("exact_quote", "")
+                        if normalize_text(quote) not in normalize_text(chunk_for_model):
+                            continue 
+                            
+                        # 3. Apply Template
+                        item = apply_template(item)
+                        
+                        # 4. Dedupe
+                        unique_id = generate_id(item['finding_type'], quote, page_num)
+                        if unique_id not in seen_hashes:
+                            findings.append({
+                                "type": item['finding_type'],
+                                "gap": item['document_gap'],
+                                "question": item['clarification_question'],
+                                "quote": quote,
+                                "page": page_num
+                            })
+                            seen_hashes.add(unique_id)
+            except Exception as e:
+                print(f"Error on Page {page_num}: {e}")
+                continue
                 
     progress_bar.empty()
-    return findings
+    
+    sorted_findings = sorted(findings, key=lambda x: (CATEGORY_ORDER.get(x["type"], 99), x["page"]))
+    return sorted_findings
 
 # --- USER INTERFACE ---
-st.title("Scope Translator (Semantic Mode)") 
-st.markdown("**Ethos:** This tool uses AI to identify undefined conditions. It moves the burden from the person to the document.")
+st.title("Prephase Scope Translator") 
+st.markdown("**Ethos:** Move the burden from the person to the document.")
 st.divider()
 
 col1, col2 = st.columns([1.5, 1])
@@ -117,37 +350,51 @@ with col1:
     if uploaded_file is not None:
         with pdfplumber.open(uploaded_file) as pdf:
             for i, page in enumerate(pdf.pages):
-                words = page.extract_words(x_tolerance=1)
-                page_text = ' '.join([w['text'] for w in words])
-                page_text = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', page_text)
+                text = page.extract_text()
+                if not text or len(text) < 50:
+                    words = page.extract_words(x_tolerance=1)
+                    text = ' '.join([w['text'] for w in words])
+                    text = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', text)
                 
-                if page_text:
-                    pages_data.append({'page': i+1, 'text': page_text})
-                    full_text_display += f"--- Page {i+1} ---\n{page_text}\n\n"
+                if text:
+                    pages_data.append({'page': i+1, 'text': text})
+                    full_text_display += f"--- Page {i+1} ---\n{text}\n\n"
         
         st.text_area("Extracted Text Content", full_text_display, height=600)
 
 with col2:
-    st.subheader("2. Analysis")
+    st.subheader("2. Audit Results")
     
     if "findings" not in st.session_state:
         st.session_state.findings = None
 
     if pages_data:
-        if st.button("Run Semantic Analysis"):
-            with st.spinner("Consulting the Analyst..."):
+        if st.button("Run Audit"):
+            with st.spinner("Scanning for undefined conditions..."):
                 st.session_state.findings = scan_document(pages_data)
         
         if st.session_state.findings:
             results = st.session_state.findings
-            st.info(f"**Scan Complete.** Found {len(results)} items requiring clarification.")
             
+            # Counts Dashboard
+            counts = Counter([item['type'] for item in results])
+            st.info(f"**Audit Complete.** Found {len(results)} items.")
+            
+            # Display Count Metrics
+            cols = st.columns(4)
+            cols[0].metric("Contractual", counts.get("Contractual Commitment", 0))
+            cols[1].metric("Explicit", counts.get("Explicit Commitment", 0))
+            cols[2].metric("Implied", counts.get("Implied Responsibility", 0))
+            cols[3].metric("Clarification", counts.get("Common Clarification Area", 0))
+            
+            st.divider()
+
             for item in results:
                 with st.container():
-                    st.markdown(f"### 🔹 {item['phrase']}")
-                    st.caption(f"**Category:** {item['category']}")
-                    st.markdown(f"> *\"{item['snippet']}\"*")
-                    st.markdown(f"**[Page {item['page']}]**")
+                    st.markdown(f"### 🔹 {item['type']}")
+                    st.markdown(f"> *\"{item['quote']}\"*")
+                    st.caption(f"**Page {item['page']}**")
+                    st.markdown(f"**Gap:** {item['gap']}")
                     st.markdown(f"**Clarification:** {item['question']}")
                     st.divider()
     else:
