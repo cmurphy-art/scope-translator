@@ -294,53 +294,163 @@ def scan_document(pages_data):
     progress.empty()
     return findings
 
-# ----------------------------
-# UI
-# ----------------------------
-st.title("Scope Translator (OpenAI)")
+# --- USER INTERFACE ---
+import html
+
+def highlight_text(full_text: str, phrase: str) -> str:
+    """
+    Returns HTML where every case-insensitive occurrence of `phrase` is wrapped in <mark>.
+    Safely escapes other text.
+    """
+    if not full_text:
+        return ""
+
+    if not phrase or len(phrase.strip()) < 2:
+        return "<pre style='white-space: pre-wrap;'>" + html.escape(full_text) + "</pre>"
+
+    # Case-insensitive find all occurrences
+    pattern = re.compile(re.escape(phrase), re.IGNORECASE)
+    matches = list(pattern.finditer(full_text))
+    if not matches:
+        return "<pre style='white-space: pre-wrap;'>" + html.escape(full_text) + "</pre>"
+
+    out = []
+    last = 0
+    for m in matches:
+        out.append(html.escape(full_text[last:m.start()]))
+        out.append("<mark>" + html.escape(full_text[m.start():m.end()]) + "</mark>")
+        last = m.end()
+    out.append(html.escape(full_text[last:]))
+
+    return "<pre style='white-space: pre-wrap;'>" + "".join(out) + "</pre>"
+
+
+st.title("Scope Translator")
 st.markdown("**Ethos:** Move the burden from the person to the document.")
 st.divider()
 
-col1, col2 = st.columns([1.5, 1])
+# Session state for click-to-jump
+if "findings" not in st.session_state:
+    st.session_state.findings = None
+if "selected_page" not in st.session_state:
+    st.session_state.selected_page = 1
+if "selected_phrase" not in st.session_state:
+    st.session_state.selected_phrase = ""
+
+# Simple CSS to create fixed-height, scrollable panes
+st.markdown(
+    """
+    <style>
+      .scroll-pane {
+        height: 78vh;
+        overflow-y: auto;
+        padding-right: 8px;
+        border: 1px solid rgba(49,51,63,0.2);
+        border-radius: 8px;
+        padding: 10px;
+        background: rgba(255,255,255,0.02);
+      }
+      mark {
+        padding: 0px 3px;
+        border-radius: 4px;
+      }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+col1, col2 = st.columns([1.6, 1.0])
+
+# We will keep a page lookup for jump-to
+pages_data = []
+page_text_by_num = {}
 
 with col1:
     st.subheader("1. Source Document")
     uploaded_file = st.file_uploader("Upload Scope PDF", type="pdf")
 
-    pages_data = []
-    full_text_display = ""
-
     if uploaded_file is not None:
         with pdfplumber.open(uploaded_file) as pdf:
             for i, page in enumerate(pdf.pages):
-                page_text = rebuild_spacing_from_words(page)
-                if page_text:
-                    pages_data.append({"page": i + 1, "text": page_text})
-                    full_text_display += f"--- Page {i+1} ---\n{page_text}\n\n"
+                # Keep your existing extraction approach
+                words = page.extract_words(x_tolerance=1)
+                page_text = " ".join([w["text"] for w in words])
+                page_text = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", page_text)
 
-        st.text_area("Extracted Text Content", full_text_display, height=600)
+                page_num = i + 1
+                if page_text:
+                    pages_data.append({"page": page_num, "text": page_text})
+                    page_text_by_num[page_num] = page_text
+
+        if pages_data:
+            max_page = max(page_text_by_num.keys())
+            st.session_state.selected_page = min(st.session_state.selected_page, max_page)
+
+            st.caption("Click a finding on the right to jump and highlight it here.")
+
+            # Page selector stays usable even without clicking
+            st.session_state.selected_page = st.number_input(
+                "Page",
+                min_value=1,
+                max_value=max_page,
+                value=int(st.session_state.selected_page),
+                step=1
+            )
+
+            selected_text = page_text_by_num.get(int(st.session_state.selected_page), "")
+
+            # Render page text with highlight
+            rendered = highlight_text(selected_text, st.session_state.selected_phrase)
+
+            st.markdown(
+                f"<div class='scroll-pane'>{rendered}</div>",
+                unsafe_allow_html=True
+            )
+        else:
+            st.warning("No text extracted from this PDF.")
 
 with col2:
-    st.subheader("2. Analysis")
-
-    if "findings" not in st.session_state:
-        st.session_state.findings = None
+    st.subheader("2. Findings")
 
     if pages_data:
-        if st.button("Run Strict Analysis"):
-            with st.spinner("Applying filters..."):
+        # Run scan
+        if st.button("Run Analysis"):
+            with st.spinner("Scanning..."):
+                # IMPORTANT: uses your existing scan_document unchanged
                 st.session_state.findings = scan_document(pages_data)
 
-        if st.session_state.findings is not None:
-            results = st.session_state.findings
+        results = st.session_state.findings
+
+        if results:
             st.info(f"**Scan complete.** Found {len(results)} items.")
 
-            for item in results:
-                with st.container():
-                    st.markdown(f"### 🔹 {item['category']}")
-                    st.caption(f"**Found:** \"{item['phrase']}\" [Page {item['page']}]")
-                    st.markdown(f"**Gap:** {item['gap']}")
-                    st.markdown(f"**Clarification:** {item['question']}")
-                    st.divider()
+            # Scrollable findings list
+            st.markdown("<div class='scroll-pane'>", unsafe_allow_html=True)
+
+            for idx, item in enumerate(results):
+                cat = item.get("category") or item.get("type") or "Finding"
+                phrase = item.get("phrase") or item.get("quote") or ""
+                page = int(item.get("page", 1))
+                gap = item.get("gap", "")
+                question = item.get("question", "")
+
+                # One click jumps the left pane to the right page + highlights phrase
+                if st.button(f"Go to Page {page}", key=f"go_{idx}_{page}"):
+                    st.session_state.selected_page = page
+                    st.session_state.selected_phrase = phrase
+                    st.rerun()
+
+                st.markdown(f"### 🔹 {cat}")
+                st.caption(f'**Found:** "{phrase}" [Page {page}]')
+                if gap:
+                    st.markdown(f"**Gap:** {gap}")
+                if question:
+                    st.markdown(f"**Clarification:** {question}")
+                st.divider()
+
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        else:
+            st.write("Run the analysis to see findings.")
     else:
         st.write("Upload a document to begin.")
