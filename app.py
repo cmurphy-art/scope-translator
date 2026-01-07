@@ -8,7 +8,7 @@ from openai import OpenAI
 # ------------------------------------------------------------
 # CONFIG
 # ------------------------------------------------------------
-st.set_page_config(layout="wide", page_title="Prephase Scope Translator (UI Jump + Scroll)")
+st.set_page_config(layout="wide", page_title="Prephase Scope Auditor")
 
 if "OPENAI_API_KEY" not in st.secrets:
     st.error("CRITICAL: Missing OPENAI_API_KEY in Streamlit Secrets.")
@@ -288,8 +288,8 @@ def render_page_with_highlight(page_text: str, highlight_phrase: str | None):
 # ------------------------------------------------------------
 # APP
 # ------------------------------------------------------------
-st.title("Scope Translator")
-st.markdown("**Ethos:** Move the burden from the person to the document.")
+st.title("Prephase Scope Auditor")
+st.markdown("**Ethos:** Neutral identification of undefined scope conditions. The burden moves from people to paper.")
 st.divider()
 
 # State
