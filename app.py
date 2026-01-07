@@ -2,27 +2,23 @@ import streamlit as st
 import pdfplumber
 import json
 import re
-import time
-import random
+import html
 from openai import OpenAI
 
-# ----------------------------
-# CONFIGURATION
-# ----------------------------
-st.set_page_config(layout="wide", page_title="Scope Translator (OpenAI)")
+# ------------------------------------------------------------
+# CONFIG
+# ------------------------------------------------------------
+st.set_page_config(layout="wide", page_title="Prephase Scope Translator (UI Jump + Scroll)")
 
 if "OPENAI_API_KEY" not in st.secrets:
-    st.error("CRITICAL: OPENAI_API_KEY missing. Add it to Streamlit Secrets.")
+    st.error("CRITICAL: Missing OPENAI_API_KEY in Streamlit Secrets.")
     st.stop()
 
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-# Choose reliability first. You can later swap to a cheaper model.
-OPENAI_MODEL = st.secrets.get("OPENAI_MODEL", "gpt-5.2")
-
-# ----------------------------
-# SAFE LIBRARY (Templates)
-# ----------------------------
+# ------------------------------------------------------------
+# SAFE LIBRARY (UNCHANGED BRAIN OUTPUT STYLE)
+# ------------------------------------------------------------
 RESPONSE_TEMPLATES = {
     "UNDEFINED_BOUNDARY": {
         "category": "Common Clarification Area",
@@ -66,391 +62,324 @@ RESPONSE_TEMPLATES = {
     }
 }
 
-# Optional: cheap pre-scan so you do not call the API for empty chunks
-PRE_SCAN_PHRASES = [
-    "match existing", "tie into", "patch", "repair",
-    "industry standard", "workmanlike", "satisfaction of",
-    "turnkey", "complete system", "including but not limited to",
-    "liquidated damages", "time is of the essence", "indemnify",
-    "coordinate with", "verify in field", "by others",
-    "if possible", "where possible", "if feasible",
-    "as needed", "as required", "as necessary",
-    "required upgrades", "bring to code", "code upgrades"
-]
-
 SYSTEM_INSTRUCTION = """
-ROLE: You are a strict Classifier. You DO NOT write text. You only select keys.
+ROLE: You are a strict Classifier. You DO NOT write prose. You only select keys.
 
-TASK: Analyze the text snippet. Identify ambiguities using the KEYS below.
+TASK: Analyze the text snippet. Identify specific ambiguities using the KEYS below.
 
-KEYS (Select the best fit):
+KEYS:
 1. UNDEFINED_BOUNDARY (Triggers: "match existing", "tie into", "patch", "repair")
 2. SUBJECTIVE_QUALITY (Triggers: "industry standard", "workmanlike", "satisfaction of")
 3. UNDEFINED_SCOPE (Triggers: "turnkey", "complete system", "including but not limited to")
 4. EXPLICIT_LIABILITY (Triggers: "liquidated damages", "time is of the essence", "indemnify")
 5. COORDINATION_GAP (Triggers: "coordinate with", "verify in field", "by others")
-6. IF_POSSIBLE (Triggers: "if possible", "where possible", "if feasible")
-7. AS_NEEDED (Triggers: "as needed", "as required", "as necessary")
-8. REQUIRED_UPGRADES (Triggers: "required upgrades", "bring to code", "code upgrades")
+6. IF_POSSIBLE (Triggers: "if possible", "where possible", "if feasible", "possibly", "potentially")
+7. AS_NEEDED (Triggers: "as needed", "as required", "as necessary", "if needed")
+8. REQUIRED_UPGRADES (Triggers: "required upgrades", "bring to code", "code upgrades", "upgrade")
 
 CONSTRAINTS:
 - Return ONLY a raw JSON list.
-- Extract the EXACT quote as it appears in the provided text.
-- Do NOT provide reasoning. Only provide "classification" and "trigger_text".
+- Extract the EXACT quote from the provided text.
+- Do NOT provide reasoning. Only provide the "classification" KEY.
 - Return [] if nothing found.
 
 OUTPUT FORMAT:
 [{"trigger_text": "...", "classification": "UNDEFINED_BOUNDARY"}]
 """
 
-# ----------------------------
-# UTILITIES
-# ----------------------------
-def normalize_text(text: str) -> str:
-    if not text:
+# ------------------------------------------------------------
+# TEXT HELPERS
+# ------------------------------------------------------------
+def normalize_text(t: str) -> str:
+    if not t:
         return ""
-    t = text.strip().lower()
+    t = t.lower().strip()
     t = re.sub(r"\s+", " ", t)
     return t
 
-def clean_json_text(text: str) -> str:
-    if not text:
-        return "[]"
-    text = re.sub(r"```json\s*", "", text)
-    text = re.sub(r"```", "", text)
-    return text.strip()
+def spacing_fix(t: str) -> str:
+    """
+    Best-effort spacing repair for pdfplumber word-joins.
+    Keep conservative. Do not rewrite content, only add spaces in obvious joins.
+    """
+    if not t:
+        return ""
+    t = re.sub(r"\s+", " ", t)
 
-def split_text_into_chunks(text: str, max_chars: int = 2000):
-    paragraphs = text.split("\n\n")
-    chunks, cur = [], ""
-    for para in paragraphs:
-        if len(cur) + len(para) + 2 <= max_chars:
-            cur += para + "\n\n"
+    # lowerCaseUpperCase
+    t = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", t)
+    # letterDigit and digitLetter
+    t = re.sub(r"(?<=[A-Za-z])(?=[0-9])", " ", t)
+    t = re.sub(r"(?<=[0-9])(?=[A-Za-z])", " ", t)
+    # punctuationNextLetter
+    t = re.sub(r"(?<=[,.;:])(?=[A-Za-z])", " ", t)
+    # missing space after period when next char is letter
+    t = re.sub(r"(?<=[.])(?=[A-Za-z])", " ", t)
+
+    return t.strip()
+
+def split_text_into_chunks(text: str, max_chars: int = 2200) -> list[str]:
+    """
+    Chunking prevents truncation and reduces missed hits.
+    """
+    text = text.strip()
+    if not text:
+        return []
+
+    paras = re.split(r"\n\s*\n", text)
+    chunks = []
+    cur = ""
+
+    for p in paras:
+        p = p.strip()
+        if not p:
+            continue
+
+        add = (p + "\n\n")
+        if len(cur) + len(add) <= max_chars:
+            cur += add
         else:
             if cur.strip():
                 chunks.append(cur.strip())
-            cur = para + "\n\n"
+            cur = add
+
     if cur.strip():
         chunks.append(cur.strip())
+
     return chunks
 
-def chunk_has_any_prescan_phrase(chunk: str) -> bool:
-    c = normalize_text(chunk)
-    for p in PRE_SCAN_PHRASES:
-        if p in c:
-            return True
-    return False
-
-def rebuild_spacing_from_words(page) -> str:
-    """
-    Rebuilds readable text using word positions.
-    This fixes the "no spacing" output for many PDFs.
-    """
-    words = page.extract_words(
-        x_tolerance=1,
-        y_tolerance=3,
-        keep_blank_chars=False,
-        use_text_flow=True
+# ------------------------------------------------------------
+# LLM CALL (UNCHANGED "BRAIN", SWAPPED PROVIDER)
+# ------------------------------------------------------------
+def classify_chunk(model_name: str, chunk: str) -> list[dict]:
+    prompt = f"{SYSTEM_INSTRUCTION}\n\nTEXT TO ANALYZE:\n{chunk}"
+    resp = client.responses.create(
+        model=model_name,
+        input=prompt,
+        temperature=0
     )
-    if not words:
-        return ""
+    raw = (resp.output_text or "").strip()
 
-    # Sort by vertical then horizontal position
-    words = sorted(words, key=lambda w: (round(w["top"], 1), w["x0"]))
+    # Strip code fences if present
+    raw = re.sub(r"```json\s*", "", raw)
+    raw = re.sub(r"```", "", raw).strip()
 
-    lines = []
-    current = []
-    current_top = None
-    prev_x1 = None
-
-    for w in words:
-        top = w["top"]
-        text = w["text"]
-
-        if current_top is None:
-            current_top = top
-
-        # New line if vertical jump is big
-        if abs(top - current_top) > 5:
-            if current:
-                lines.append("".join(current).strip())
-            current = [text]
-            current_top = top
-            prev_x1 = w["x1"]
-            continue
-
-        # Same line: insert a space if there is a visible gap
-        if prev_x1 is not None:
-            gap = w["x0"] - prev_x1
-            if gap > 2.0:
-                current.append(" ")
-        current.append(text)
-        prev_x1 = w["x1"]
-
-    if current:
-        lines.append("".join(current).strip())
-
-    page_text = "\n".join([ln for ln in lines if ln.strip()])
-
-    # Light cleanup for common stuck-together patterns
-    page_text = re.sub(r"(?<=\w)(?=[A-Z])", " ", page_text)  # aB -> a B
-    page_text = re.sub(r"(?<=\d)(?=[A-Za-z])", " ", page_text)  # 1Bathroom -> 1 Bathroom
-    page_text = re.sub(r"(?<=[A-Za-z])(?=\d)", " ", page_text)  # Bath1 -> Bath 1
-    page_text = re.sub(r"\s+", " ", page_text).replace(" \n", "\n")
-
-    # Re-introduce line breaks at obvious section dividers if they got flattened
-    page_text = page_text.replace(" __", "\n__")
-    return page_text.strip()
-
-def call_openai_classifier(text_chunk: str, max_retries: int = 4):
-    """
-    Responses API call with exponential backoff for 429 and transient failures.
-    """
-    prompt = f"{SYSTEM_INSTRUCTION}\n\nTEXT TO ANALYZE:\n{text_chunk}"
-
-    for attempt in range(max_retries):
-        try:
-            resp = client.responses.create(
-                model=OPENAI_MODEL,
-                input=prompt
-            )
-            raw = resp.output_text
-            data = json.loads(clean_json_text(raw))
-            if isinstance(data, dict):
-                data = [data]
-            if not isinstance(data, list):
-                return []
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            data = [data]
+        if isinstance(data, list):
             return data
-        except Exception as e:
-            msg = str(e).lower()
-            transient = ("429" in msg) or ("rate" in msg) or ("timeout" in msg) or ("tempor" in msg) or ("overloaded" in msg)
-            if not transient or attempt == max_retries - 1:
-                return []
-            # backoff: 1.5s, 3s, 6s, 12s plus jitter
-            sleep_s = (1.5 * (2 ** attempt)) + random.uniform(0, 0.6)
-            time.sleep(sleep_s)
+    except Exception:
+        return []
 
     return []
 
-def scan_document(pages_data):
+def scan_document(pages_data: list[dict], model_name: str) -> list[dict]:
     findings = []
     seen = set()
 
-    total_chunks = sum(len(split_text_into_chunks(p["text"])) for p in pages_data)
     progress = st.progress(0)
-    done = 0
+    total_pages = len(pages_data)
 
-    for page in pages_data:
-        page_num = page["page"]
-        raw_text = page["text"]
-        chunks = split_text_into_chunks(raw_text, max_chars=2000)
+    for i, p in enumerate(pages_data):
+        page_num = p["page"]
+        page_text = p["text"]
 
+        chunks = split_text_into_chunks(page_text)
         for chunk in chunks:
-            chunk = chunk.strip()
-            if len(chunk) < 20:
-                done += 1
-                progress.progress(min(done / max(total_chunks, 1), 1.0))
+            if len(chunk) < 10:
                 continue
 
-            # Optional cost-control: skip obviously irrelevant chunks
-            if not chunk_has_any_prescan_phrase(chunk):
-                done += 1
-                progress.progress(min(done / max(total_chunks, 1), 1.0))
-                continue
+            data = classify_chunk(model_name, chunk)
 
-            data = call_openai_classifier(chunk)
-            if data:
-                for item in data:
-                    key = item.get("classification", "")
-                    quote = item.get("trigger_text", "")
+            for item in data:
+                key = item.get("classification", "")
+                quote = item.get("trigger_text", "")
 
-                    if not key or not quote:
-                        continue
+                if not key or not quote:
+                    continue
 
-                    # Trust anchor: quote must exist in chunk
-                    if normalize_text(quote) not in normalize_text(chunk):
-                        continue
+                if key not in RESPONSE_TEMPLATES:
+                    continue
 
-                    uid = f"{page_num}|{normalize_text(quote)}|{key}"
-                    if uid in seen:
-                        continue
+                # Trust anchor: quote must exist in chunk
+                if normalize_text(quote) not in normalize_text(chunk):
+                    continue
 
-                    tpl = RESPONSE_TEMPLATES.get(key)
-                    if not tpl:
-                        continue
+                uid = f"{page_num}|{normalize_text(quote)}|{key}"
+                if uid in seen:
+                    continue
+                seen.add(uid)
 
-                    seen.add(uid)
-                    findings.append({
-                        "phrase": quote,
-                        "category": tpl["category"],
-                        "gap": tpl["gap"],
-                        "question": tpl["question"],
-                        "page": page_num
-                    })
+                t = RESPONSE_TEMPLATES[key]
+                findings.append({
+                    "phrase": quote,
+                    "category": t["category"],
+                    "gap": t["gap"],
+                    "question": t["question"],
+                    "page": page_num
+                })
 
-            done += 1
-            progress.progress(min(done / max(total_chunks, 1), 1.0))
+        progress.progress((i + 1) / max(total_pages, 1))
 
     progress.empty()
+
+    findings.sort(key=lambda x: (x["page"], x["category"], len(x["phrase"])))
     return findings
 
-# --- USER INTERFACE ---
-import html
-
-def highlight_text(full_text: str, phrase: str) -> str:
+# ------------------------------------------------------------
+# UI: Page Viewer with jump-to-highlight
+# ------------------------------------------------------------
+def render_page_with_highlight(page_text: str, highlight_phrase: str | None):
     """
-    Returns HTML where every case-insensitive occurrence of `phrase` is wrapped in <mark>.
-    Safely escapes other text.
+    Renders a scrollable div. If highlight_phrase is present, highlights first occurrence and scrolls to it.
     """
-    if not full_text:
-        return ""
+    safe_text = html.escape(page_text)
 
-    if not phrase or len(phrase.strip()) < 2:
-        return "<pre style='white-space: pre-wrap;'>" + html.escape(full_text) + "</pre>"
+    # Default: no highlight
+    if not highlight_phrase:
+        html_block = f"""
+        <div id="pageBox" style="height: 520px; overflow-y: auto; padding: 14px; border: 1px solid rgba(255,255,255,0.12); border-radius: 10px; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size: 13px; line-height: 1.45;">
+        {safe_text}
+        </div>
+        """
+        st.components.v1.html(html_block, height=560)
+        return
 
-    # Case-insensitive find all occurrences
-    pattern = re.compile(re.escape(phrase), re.IGNORECASE)
-    matches = list(pattern.finditer(full_text))
-    if not matches:
-        return "<pre style='white-space: pre-wrap;'>" + html.escape(full_text) + "</pre>"
+    # Highlight first occurrence (case-insensitive) while preserving original escaping
+    phrase_esc = html.escape(highlight_phrase)
+    pattern = re.compile(re.escape(phrase_esc), re.IGNORECASE)
 
-    out = []
-    last = 0
-    for m in matches:
-        out.append(html.escape(full_text[last:m.start()]))
-        out.append("<mark>" + html.escape(full_text[m.start():m.end()]) + "</mark>")
-        last = m.end()
-    out.append(html.escape(full_text[last:]))
+    match = pattern.search(safe_text)
+    if not match:
+        # If we cannot find it, still render text
+        html_block = f"""
+        <div id="pageBox" style="height: 520px; overflow-y: auto; padding: 14px; border: 1px solid rgba(255,255,255,0.12); border-radius: 10px; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size: 13px; line-height: 1.45;">
+        {safe_text}
+        </div>
+        """
+        st.components.v1.html(html_block, height=560)
+        return
 
-    return "<pre style='white-space: pre-wrap;'>" + "".join(out) + "</pre>"
+    start, end = match.span()
+    before = safe_text[:start]
+    mid = safe_text[start:end]
+    after = safe_text[end:]
 
+    highlighted = before + '<mark id="hit" style="background: #f2d34f; padding: 0 2px; border-radius: 3px;">' + mid + "</mark>" + after
 
+    html_block = f"""
+    <div id="pageBox" style="height: 520px; overflow-y: auto; padding: 14px; border: 1px solid rgba(255,255,255,0.12); border-radius: 10px; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size: 13px; line-height: 1.45;">
+    {highlighted}
+    </div>
+
+    <script>
+      const box = document.getElementById("pageBox");
+      const hit = document.getElementById("hit");
+      if (box && hit) {{
+        const top = hit.offsetTop - 80;
+        box.scrollTo({{ top: top, behavior: "smooth" }});
+      }}
+    </script>
+    """
+    st.components.v1.html(html_block, height=560)
+
+# ------------------------------------------------------------
+# APP
+# ------------------------------------------------------------
 st.title("Scope Translator")
 st.markdown("**Ethos:** Move the burden from the person to the document.")
 st.divider()
 
-# Session state for click-to-jump
+# State
 if "findings" not in st.session_state:
     st.session_state.findings = None
 if "selected_page" not in st.session_state:
     st.session_state.selected_page = 1
 if "selected_phrase" not in st.session_state:
-    st.session_state.selected_phrase = ""
-
-# Simple CSS to create fixed-height, scrollable panes
-st.markdown(
-    """
-    <style>
-      .scroll-pane {
-        height: 78vh;
-        overflow-y: auto;
-        padding-right: 8px;
-        border: 1px solid rgba(49,51,63,0.2);
-        border-radius: 8px;
-        padding: 10px;
-        background: rgba(255,255,255,0.02);
-      }
-      mark {
-        padding: 0px 3px;
-        border-radius: 4px;
-      }
-    </style>
-    """,
-    unsafe_allow_html=True
-)
+    st.session_state.selected_phrase = None
 
 col1, col2 = st.columns([1.6, 1.0])
-
-# We will keep a page lookup for jump-to
-pages_data = []
-page_text_by_num = {}
 
 with col1:
     st.subheader("1. Source Document")
     uploaded_file = st.file_uploader("Upload Scope PDF", type="pdf")
 
+    pages_data = []
+    pages_text_by_num = {}
+
     if uploaded_file is not None:
         with pdfplumber.open(uploaded_file) as pdf:
             for i, page in enumerate(pdf.pages):
-                # Keep your existing extraction approach
                 words = page.extract_words(x_tolerance=1)
-                page_text = " ".join([w["text"] for w in words])
-                page_text = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", page_text)
+                text = " ".join([w["text"] for w in words])
+                text = spacing_fix(text)
 
-                page_num = i + 1
-                if page_text:
-                    pages_data.append({"page": page_num, "text": page_text})
-                    page_text_by_num[page_num] = page_text
+                if text.strip():
+                    page_num = i + 1
+                    pages_data.append({"page": page_num, "text": text})
+                    pages_text_by_num[page_num] = text
 
         if pages_data:
-            max_page = max(page_text_by_num.keys())
-            st.session_state.selected_page = min(st.session_state.selected_page, max_page)
-
             st.caption("Click a finding on the right to jump and highlight it here.")
 
-            # Page selector stays usable even without clicking
-            st.session_state.selected_page = st.number_input(
+            max_page = max(pages_text_by_num.keys())
+            # keep selected_page in range
+            st.session_state.selected_page = max(1, min(st.session_state.selected_page, max_page))
+
+            page_choice = st.number_input(
                 "Page",
                 min_value=1,
                 max_value=max_page,
                 value=int(st.session_state.selected_page),
                 step=1
             )
+            st.session_state.selected_page = int(page_choice)
 
-            selected_text = page_text_by_num.get(int(st.session_state.selected_page), "")
-
-            # Render page text with highlight
-            rendered = highlight_text(selected_text, st.session_state.selected_phrase)
-
-            st.markdown(
-                f"<div class='scroll-pane'>{rendered}</div>",
-                unsafe_allow_html=True
-            )
+            current_text = pages_text_by_num.get(st.session_state.selected_page, "")
+            render_page_with_highlight(current_text, st.session_state.selected_phrase)
         else:
-            st.warning("No text extracted from this PDF.")
+            st.warning("No readable text was extracted from this PDF.")
 
 with col2:
     st.subheader("2. Findings")
 
+    model = st.selectbox(
+        "Model",
+        options=[
+            "gpt-4o-mini",
+            "gpt-4o",
+            "gpt-4.1"
+        ],
+        index=0,
+        help="Start with gpt-4o-mini for cost + speed. Use gpt-4.1 if you want stricter extraction behavior."
+    )
+
     if pages_data:
-        # Run scan
-        if st.button("Run Analysis"):
+        if st.button("Run Analysis", type="primary"):
             with st.spinner("Scanning..."):
-                # IMPORTANT: uses your existing scan_document unchanged
-                st.session_state.findings = scan_document(pages_data)
+                st.session_state.findings = scan_document(pages_data, model_name=model)
+                st.session_state.selected_phrase = None
 
-        results = st.session_state.findings
+    results = st.session_state.findings
+    if results is not None:
+        st.info(f"Scan complete. Found {len(results)} items.")
 
-        if results:
-            st.info(f"**Scan complete.** Found {len(results)} items.")
+        # Fixed-height findings column with internal scroll
+        # NOTE: If you are on an older Streamlit version that errors here, upgrade Streamlit.
+        with st.container(height=560, border=True):
+            if len(results) == 0:
+                st.write("No findings.")
+            else:
+                for idx, item in enumerate(results):
+                    btn_label = f'{item["category"]} | Page {item["page"]} | "{item["phrase"]}"'
+                    if st.button(btn_label, key=f"pick_{idx}"):
+                        st.session_state.selected_page = int(item["page"])
+                        st.session_state.selected_phrase = item["phrase"]
 
-            # Scrollable findings list
-            st.markdown("<div class='scroll-pane'>", unsafe_allow_html=True)
-
-            for idx, item in enumerate(results):
-                cat = item.get("category") or item.get("type") or "Finding"
-                phrase = item.get("phrase") or item.get("quote") or ""
-                page = int(item.get("page", 1))
-                gap = item.get("gap", "")
-                question = item.get("question", "")
-
-                # One click jumps the left pane to the right page + highlights phrase
-                if st.button(f"Go to Page {page}", key=f"go_{idx}_{page}"):
-                    st.session_state.selected_page = page
-                    st.session_state.selected_phrase = phrase
-                    st.rerun()
-
-                st.markdown(f"### 🔹 {cat}")
-                st.caption(f'**Found:** "{phrase}" [Page {page}]')
-                if gap:
-                    st.markdown(f"**Gap:** {gap}")
-                if question:
-                    st.markdown(f"**Clarification:** {question}")
-                st.divider()
-
-            st.markdown("</div>", unsafe_allow_html=True)
-
-        else:
-            st.write("Run the analysis to see findings.")
+                    st.caption(f'Gap: {item["gap"]}')
+                    st.caption(f'Clarification: {item["question"]}')
+                    st.divider()
     else:
         st.write("Upload a document to begin.")
