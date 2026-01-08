@@ -1,30 +1,36 @@
 import streamlit as st
 import pdfplumber
-import json
+import csv
+import io
 import re
 import html
-import csv
-from pathlib import Path
+import hashlib
+import shutil
+from dataclasses import dataclass
+from typing import Optional, List, Dict
+
 from openai import OpenAI
+
+# OCR deps (pip)
+import pytesseract
+import pypdfium2 as pdfium
+from PIL import Image
 
 # ------------------------------------------------------------
 # CONFIG
 # ------------------------------------------------------------
-st.set_page_config(layout="wide", page_title="Prephase Scope Auditor")
+st.set_page_config(layout="wide", page_title="Prephase Scope Translator (UI Jump + Scroll)")
 
 if "OPENAI_API_KEY" not in st.secrets:
     st.error("CRITICAL: Missing OPENAI_API_KEY in Streamlit Secrets.")
     st.stop()
 
-client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])  # do not change
 
-RULES_PATH_CANDIDATES = [
-    Path("rules.csv"),
-    Path("./rules.csv"),
-]
+RULES_FILENAME = "rules.csv"
 
 # ------------------------------------------------------------
-# HELPERS
+# TEXT HELPERS
 # ------------------------------------------------------------
 def normalize_text(t: str) -> str:
     if not t:
@@ -33,12 +39,8 @@ def normalize_text(t: str) -> str:
     t = re.sub(r"\s+", " ", t)
     return t
 
-
 def spacing_fix(t: str) -> str:
-    """
-    Best-effort spacing repair for pdfplumber word-joins.
-    Conservative: adds spaces in obvious joins, doesn't rewrite wording.
-    """
+    """Conservative spacing repair for pdf word-joins."""
     if not t:
         return ""
     t = re.sub(r"\s+", " ", t)
@@ -55,57 +57,29 @@ def spacing_fix(t: str) -> str:
 
     return t.strip()
 
+def file_hash(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
-def split_text_into_chunks(text: str, max_chars: int = 2400) -> list[str]:
-    text = text.strip()
-    if not text:
-        return []
+# ------------------------------------------------------------
+# RULES LOADING (BRAIN)
+# ------------------------------------------------------------
+@dataclass
+class Rule:
+    trigger_phrase: str
+    category_tag: str
+    target_section: str
+    risk_explanation: str
+    builder_impact: str
+    clarification_question: str
+    confidence_requirement: str
+    suppression_rule: str
 
-    paras = re.split(r"\n\s*\n", text)
-    chunks = []
-    cur = ""
-
-    for p in paras:
-        p = p.strip()
-        if not p:
-            continue
-
-        add = (p + "\n\n")
-        if len(cur) + len(add) <= max_chars:
-            cur += add
-        else:
-            if cur.strip():
-                chunks.append(cur.strip())
-            cur = add
-
-    if cur.strip():
-        chunks.append(cur.strip())
-
-    return chunks
-
-
-def find_rules_path() -> Path | None:
-    for p in RULES_PATH_CANDIDATES:
-        if p.exists() and p.is_file():
-            return p
-    return None
-
-
-def load_rules() -> tuple[dict, list[str], str | None]:
-    """
-    Loads rules.csv and returns:
-      - rules_by_phrase: dict keyed by normalized trigger_phrase
-      - phrases: list of trigger phrases (original)
-      - warning: optional warning string if file missing/invalid
-    """
-    rules_path = find_rules_path()
-    if not rules_path:
-        return {}, [], "Note: rules.csv not detected. Using fallback template language."
-
+def load_rules_csv(path: str) -> List[Rule]:
+    rules: List[Rule] = []
     try:
-        with rules_path.open("r", encoding="utf-8-sig", newline="") as f:
+        with open(path, "r", encoding="utf-8-sig", newline="") as f:
             reader = csv.DictReader(f)
-            required = {
+            required_cols = [
                 "trigger_phrase",
                 "category_tag",
                 "target_section",
@@ -114,239 +88,201 @@ def load_rules() -> tuple[dict, list[str], str | None]:
                 "clarification_question",
                 "confidence_requirement",
                 "suppression_rule",
-            }
-            if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
-                return {}, [], "Note: rules.csv detected but headers are invalid. Using fallback template language."
+            ]
+            for c in required_cols:
+                if c not in reader.fieldnames:
+                    raise ValueError(f"Missing column in rules.csv: {c}")
 
-            rules_by_phrase = {}
-            phrases = []
             for row in reader:
-                phrase = (row.get("trigger_phrase") or "").strip()
-                if not phrase:
+                trig = (row.get("trigger_phrase") or "").strip()
+                if not trig:
                     continue
-                key = normalize_text(phrase)
-                # last write wins if duplicates exist
-                rules_by_phrase[key] = {
-                    "trigger_phrase": phrase,
-                    "category_tag": (row.get("category_tag") or "").strip(),
-                    "target_section": (row.get("target_section") or "").strip(),
-                    "risk_explanation": (row.get("risk_explanation") or "").strip(),
-                    "builder_impact": (row.get("builder_impact") or "").strip(),
-                    "clarification_question": (row.get("clarification_question") or "").strip(),
-                    "confidence_requirement": (row.get("confidence_requirement") or "").strip(),
-                    "suppression_rule": (row.get("suppression_rule") or "").strip(),
-                }
-                phrases.append(phrase)
-
-            if not rules_by_phrase:
-                return {}, [], "Note: rules.csv detected but no usable rows found. Using fallback template language."
-
-            # de-dupe phrases while preserving order
-            seen = set()
-            phrases_unique = []
-            for p in phrases:
-                k = normalize_text(p)
-                if k in seen:
-                    continue
-                seen.add(k)
-                phrases_unique.append(p)
-
-            return rules_by_phrase, phrases_unique, None
-
-    except Exception:
-        return {}, [], "Note: rules.csv detected but could not be read. Using fallback template language."
-
-
-def build_system_instruction(trigger_phrases: list[str]) -> str:
-    """
-    Build the extraction instruction. We keep this strict so the output is predictable.
-    """
-    # Keep the list compact but explicit.
-    phrase_lines = "\n".join([f"- {p}" for p in trigger_phrases])
-
-    return f"""
-ROLE: You are a strict extractor. You do NOT write prose.
-
-TASK:
-You are given TEXT. Identify any occurrences of the trigger phrases below.
-
-TRIGGER PHRASES (case-insensitive):
-{phrase_lines}
-
-RULES:
-- Return ONLY a raw JSON list.
-- Each item must be an object with:
-  - "trigger_phrase": one of the phrases from the list above (exactly as written in the list)
-  - "trigger_text": the EXACT quote from the provided TEXT that matches (preserve original capitalization/spaces/punctuation as it appears)
-- Do NOT include reasoning.
-- If nothing is found, return [].
-
-OUTPUT FORMAT:
-[{{"trigger_phrase":"if possible","trigger_text":"If possible"}}]
-""".strip()
-
-
-def classify_chunk(model_name: str, chunk: str, system_instruction: str) -> list[dict]:
-    prompt = f"{system_instruction}\n\nTEXT:\n{chunk}"
-    resp = client.responses.create(
-        model=model_name,
-        input=prompt,
-        temperature=0
-    )
-    raw = (resp.output_text or "").strip()
-
-    # strip code fences if any
-    raw = re.sub(r"```json\s*", "", raw)
-    raw = re.sub(r"```", "", raw).strip()
-
-    try:
-        data = json.loads(raw)
-        if isinstance(data, dict):
-            data = [data]
-        if isinstance(data, list):
-            return data
+                rules.append(
+                    Rule(
+                        trigger_phrase=trig,
+                        category_tag=(row.get("category_tag") or "").strip(),
+                        target_section=(row.get("target_section") or "").strip(),
+                        risk_explanation=(row.get("risk_explanation") or "").strip(),
+                        builder_impact=(row.get("builder_impact") or "").strip(),
+                        clarification_question=(row.get("clarification_question") or "").strip(),
+                        confidence_requirement=(row.get("confidence_requirement") or "").strip(),
+                        suppression_rule=(row.get("suppression_rule") or "").strip(),
+                    )
+                )
+    except FileNotFoundError:
+        return []
     except Exception:
         return []
+    return rules
 
-    return []
+# ------------------------------------------------------------
+# OCR FALLBACK (BRAIN-SIDE ONLY)
+# ------------------------------------------------------------
+def ocr_available() -> bool:
+    # pytesseract needs the system "tesseract" binary
+    return shutil.which("tesseract") is not None
 
-
-def scan_document(pages_data: list[dict], model_name: str, rules_by_phrase: dict, trigger_phrases: list[str]) -> list[dict]:
+@st.cache_data(show_spinner=False)
+def ocr_page_text(pdf_bytes: bytes, page_index: int) -> str:
     """
-    Returns findings list.
-    Each finding includes internal confidence/suppression but UI won't render them.
+    OCR a single page (0-indexed) using pdfium renderer + pytesseract.
+    Cached by pdf hash + page index via st.cache_data.
     """
-    findings = []
+    doc = pdfium.PdfDocument(pdf_bytes)
+    page = doc.get_page(page_index)
+    # Render at higher scale for better OCR
+    bitmap = page.render(scale=2.0)
+    pil_image = bitmap.to_pil()
+    text = pytesseract.image_to_string(pil_image, lang="eng")
+    return spacing_fix(text)
+
+def extract_pages_text(uploaded_pdf_bytes: bytes) -> Dict[int, str]:
+    """
+    Extract page text using pdfplumber first.
+    If a page yields no usable text, OCR that page.
+    Returns {page_num (1-indexed): text}
+    """
+    pages_text: Dict[int, str] = {}
+
+    # 1) pdfplumber pass
+    with pdfplumber.open(io.BytesIO(uploaded_pdf_bytes)) as pdf:
+        for i, page in enumerate(pdf.pages):
+            words = page.extract_words(x_tolerance=1) or []
+            text = " ".join([w.get("text", "") for w in words]).strip()
+            text = spacing_fix(text)
+
+            page_num = i + 1
+            pages_text[page_num] = text
+
+    # 2) OCR fallback (only for empty/near-empty pages)
+    # Keep threshold conservative so we don't OCR normal text PDFs.
+    needs_ocr = [p for p, t in pages_text.items() if len((t or "").strip()) < 20]
+
+    if needs_ocr:
+        if not ocr_available():
+            st.warning(
+                "This PDF appears to be scanned (no selectable text). "
+                "OCR is not available on this deployment. "
+                "Add a packages.txt file with `tesseract-ocr` and redeploy."
+            )
+            return pages_text
+
+        # Run OCR only for pages that need it
+        for page_num in needs_ocr:
+            idx0 = page_num - 1
+            ocr_text = ocr_page_text(uploaded_pdf_bytes, idx0)
+            # Only replace if OCR produced something meaningful
+            if len((ocr_text or "").strip()) >= 20:
+                pages_text[page_num] = ocr_text
+
+    return pages_text
+
+# ------------------------------------------------------------
+# SCANNING (RULES ENGINE)
+# ------------------------------------------------------------
+def scan_with_rules(pages_text_by_num: Dict[int, str], rules: List[Rule]) -> List[dict]:
+    findings: List[dict] = []
     seen = set()
 
-    system_instruction = build_system_instruction(trigger_phrases)
-
+    page_items = sorted(pages_text_by_num.items(), key=lambda x: x[0])
     progress = st.progress(0)
-    total_pages = len(pages_data)
+    total = max(len(page_items), 1)
 
-    for i, p in enumerate(pages_data):
-        page_num = p["page"]
-        page_text = p["text"]
+    for idx, (page_num, page_text) in enumerate(page_items):
+        if not page_text or len(page_text.strip()) < 10:
+            progress.progress((idx + 1) / total)
+            continue
 
-        chunks = split_text_into_chunks(page_text)
-        for chunk in chunks:
-            if len(chunk) < 10:
+        for r in rules:
+            phrase = r.trigger_phrase.strip()
+            if not phrase:
                 continue
 
-            hits = classify_chunk(model_name, chunk, system_instruction)
-
-            for item in hits:
-                trig_phrase = (item.get("trigger_phrase") or "").strip()
-                trig_text = (item.get("trigger_text") or "").strip()
-                if not trig_phrase or not trig_text:
-                    continue
-
-                rule = rules_by_phrase.get(normalize_text(trig_phrase))
-                if not rule:
-                    continue
-
-                # Trust anchor: extracted quote must exist in the chunk (normalized)
-                if normalize_text(trig_text) not in normalize_text(chunk):
-                    continue
-
-                uid = f"{page_num}|{normalize_text(trig_phrase)}|{normalize_text(trig_text)}"
+            # Case-insensitive literal search
+            pattern = re.compile(re.escape(phrase), re.IGNORECASE)
+            for m in pattern.finditer(page_text):
+                hit = m.group(0)
+                uid = f"{page_num}|{normalize_text(hit)}|{normalize_text(phrase)}"
                 if uid in seen:
                     continue
                 seen.add(uid)
 
-                findings.append({
-                    "uid": uid,
-                    "page": page_num,
-                    "phrase": trig_text,  # what we highlight
-                    "trigger_phrase": trig_phrase,
-                    "category_tag": rule["category_tag"],
-                    "target_section": rule["target_section"],
-                    "risk_explanation": rule["risk_explanation"],
-                    "builder_impact": rule["builder_impact"],
-                    "clarification_question": rule["clarification_question"],
-                    "confidence_requirement": rule["confidence_requirement"],  # internal
-                    "suppression_rule": rule["suppression_rule"],              # internal
-                })
+                findings.append(
+                    {
+                        "uid": uid,
+                        "phrase": hit,
+                        "category_tag": r.category_tag,
+                        "target_section": r.target_section,
+                        "risk_explanation": r.risk_explanation,
+                        "builder_impact": r.builder_impact,
+                        "clarification_question": r.clarification_question,
+                        # keep these in data (brain), but DO NOT display on cards:
+                        "confidence_requirement": r.confidence_requirement,
+                        "suppression_rule": r.suppression_rule,
+                        "page": page_num,
+                    }
+                )
 
-        progress.progress((i + 1) / max(total_pages, 1))
+        progress.progress((idx + 1) / total)
 
     progress.empty()
-
     findings.sort(key=lambda x: (x["page"], x["category_tag"], len(x["phrase"])))
     return findings
 
-
-def render_full_document_scroll(pages_text_by_num: dict[int, str], selected_page: int | None, highlight_phrase: str | None):
+# ------------------------------------------------------------
+# UI: Page Viewer with jump-to-highlight (UNCHANGED)
+# ------------------------------------------------------------
+def render_page_with_highlight(page_text: str, highlight_phrase: Optional[str]):
     """
-    One scrollable reader for the entire doc, with page separators.
-    If highlight_phrase is provided, we highlight first occurrence on the selected_page and scroll to it.
+    Renders a scrollable div. If highlight_phrase is present, highlights first occurrence and scrolls to it.
     """
-    # Build HTML for all pages
-    parts = []
-    hit_id = None
+    safe_text = html.escape(page_text or "")
 
-    for page_num in sorted(pages_text_by_num.keys()):
-        raw_text = pages_text_by_num[page_num] or ""
-        safe_text = html.escape(raw_text)
-
-        # Default page content
-        page_body = safe_text
-
-        # If this is the selected page, try to highlight the phrase
-        if highlight_phrase and selected_page == page_num:
-            phrase_esc = html.escape(highlight_phrase)
-            pattern = re.compile(re.escape(phrase_esc), re.IGNORECASE)
-            m = pattern.search(page_body)
-            if m:
-                start, end = m.span()
-                before = page_body[:start]
-                mid = page_body[start:end]
-                after = page_body[end:]
-                hit_id = "hit"
-                page_body = before + f'<mark id="{hit_id}" style="background:#f2d34f; padding:0 2px; border-radius:3px;">' + mid + "</mark>" + after
-
-        parts.append(f"""
-        <div id="page_{page_num}" style="padding: 10px 10px 14px 10px; border-bottom: 1px solid rgba(255,255,255,0.10);">
-          <div style="opacity:0.75; font-size:12px; margin-bottom:6px;">Page {page_num}</div>
-          <div style="white-space: pre-wrap;">{page_body}</div>
+    # Default: no highlight
+    if not highlight_phrase:
+        html_block = f"""
+        <div id="pageBox" style="height: 520px; overflow-y: auto; padding: 14px; border: 1px solid rgba(255,255,255,0.12); border-radius: 10px; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size: 13px; line-height: 1.45;">
+        {safe_text}
         </div>
-        """)
-
-    joined = "\n".join(parts)
-
-    # Scroll logic: if hit exists scroll to hit, else if selected_page scroll to that page anchor
-    scroll_js = ""
-    if hit_id:
-        scroll_js = """
-        <script>
-          const box = document.getElementById("docBox");
-          const hit = document.getElementById("hit");
-          if (box && hit) {
-            const top = hit.offsetTop - 120;
-            box.scrollTo({ top: top, behavior: "smooth" });
-          }
-        </script>
         """
-    elif selected_page:
-        scroll_js = f"""
-        <script>
-          const box = document.getElementById("docBox");
-          const el = document.getElementById("page_{int(selected_page)}");
-          if (box && el) {{
-            const top = el.offsetTop - 40;
-            box.scrollTo({{ top: top, behavior: "smooth" }});
-          }}
-        </script>
+        st.components.v1.html(html_block, height=560)
+        return
+
+    phrase_esc = html.escape(highlight_phrase)
+    pattern = re.compile(re.escape(phrase_esc), re.IGNORECASE)
+
+    match = pattern.search(safe_text)
+    if not match:
+        html_block = f"""
+        <div id="pageBox" style="height: 520px; overflow-y: auto; padding: 14px; border: 1px solid rgba(255,255,255,0.12); border-radius: 10px; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size: 13px; line-height: 1.45;">
+        {safe_text}
+        </div>
         """
+        st.components.v1.html(html_block, height=560)
+        return
+
+    start, end = match.span()
+    before = safe_text[:start]
+    mid = safe_text[start:end]
+    after = safe_text[end:]
+
+    highlighted = before + '<mark id="hit" style="background: #f2d34f; padding: 0 2px; border-radius: 3px;">' + mid + "</mark>" + after
 
     html_block = f"""
-    <div id="docBox" style="height: 560px; overflow-y: auto; padding: 0px; border: 1px solid rgba(255,255,255,0.12); border-radius: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size: 13px; line-height: 1.45;">
-      {joined}
+    <div id="pageBox" style="height: 520px; overflow-y: auto; padding: 14px; border: 1px solid rgba(255,255,255,0.12); border-radius: 10px; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size: 13px; line-height: 1.45;">
+    {highlighted}
     </div>
-    {scroll_js}
-    """
-    st.components.v1.html(html_block, height=600)
 
+    <script>
+      const box = document.getElementById("pageBox");
+      const hit = document.getElementById("hit");
+      if (box && hit) {{
+        const top = hit.offsetTop - 80;
+        box.scrollTo({{ top: top, behavior: "smooth" }});
+      }}
+    </script>
+    """
+    st.components.v1.html(html_block, height=560)
 
 # ------------------------------------------------------------
 # APP
@@ -358,16 +294,17 @@ st.divider()
 # State
 if "findings" not in st.session_state:
     st.session_state.findings = None
-if "selected_uid" not in st.session_state:
-    st.session_state.selected_uid = None
 if "selected_page" not in st.session_state:
-    st.session_state.selected_page = None
+    st.session_state.selected_page = 1
 if "selected_phrase" not in st.session_state:
     st.session_state.selected_phrase = None
+if "selected_uid" not in st.session_state:
+    st.session_state.selected_uid = None
 if "done_map" not in st.session_state:
     st.session_state.done_map = {}  # uid -> bool
 
-rules_by_phrase, trigger_phrases, rules_warning = load_rules()
+rules = load_rules_csv(RULES_FILENAME)
+rules_ok = len(rules) > 0
 
 col1, col2 = st.columns([1.6, 1.0])
 
@@ -375,29 +312,29 @@ with col1:
     st.subheader("1. Source Document")
     uploaded_file = st.file_uploader("Upload Scope PDF", type="pdf")
 
-    pages_data = []
-    pages_text_by_num = {}
+    pages_text_by_num: Dict[int, str] = {}
 
     if uploaded_file is not None:
-        with pdfplumber.open(uploaded_file) as pdf:
-            for i, page in enumerate(pdf.pages):
-                # word-based extraction for more consistent “exact quote” matching
-                words = page.extract_words(x_tolerance=1)
-                text = " ".join([w.get("text", "") for w in words if w.get("text")])
-                text = spacing_fix(text)
+        pdf_bytes = uploaded_file.getvalue()
+        pages_text_by_num = extract_pages_text(pdf_bytes)
 
-                if text.strip():
-                    page_num = i + 1
-                    pages_data.append({"page": page_num, "text": text})
-                    pages_text_by_num[page_num] = text
-
-        if pages_data:
+        if pages_text_by_num and any(len((t or "").strip()) >= 10 for t in pages_text_by_num.values()):
             st.caption("Click a finding on the right to jump and highlight it here.")
-            render_full_document_scroll(
-                pages_text_by_num=pages_text_by_num,
-                selected_page=st.session_state.selected_page,
-                highlight_phrase=st.session_state.selected_phrase
+
+            max_page = max(pages_text_by_num.keys())
+            st.session_state.selected_page = max(1, min(st.session_state.selected_page, max_page))
+
+            page_choice = st.number_input(
+                "Page",
+                min_value=1,
+                max_value=max_page,
+                value=int(st.session_state.selected_page),
+                step=1
             )
+            st.session_state.selected_page = int(page_choice)
+
+            current_text = pages_text_by_num.get(st.session_state.selected_page, "")
+            render_page_with_highlight(current_text, st.session_state.selected_phrase)
         else:
             st.warning("No readable text was extracted from this PDF.")
 
@@ -408,27 +345,23 @@ with col2:
         "Model",
         options=["gpt-4o-mini", "gpt-4o", "gpt-4.1"],
         index=0,
-        help="Start with gpt-4o-mini for cost + speed. Use gpt-4.1 if you want stricter extraction behavior."
+        help="UI only. The rules engine drives findings; model selection is kept for continuity."
     )
 
-    if rules_warning:
-        st.caption(rules_warning)
+    if not rules_ok:
+        st.caption("Note: rules.csv not detected or invalid. Using fallback template language.")
+    else:
+        st.caption("Using rules.csv for detection.")
 
-    if pages_data:
-        if st.button("Run Analysis", type="primary", use_container_width=True):
-            if not trigger_phrases or not rules_by_phrase:
-                st.error("rules.csv missing or invalid. Upload/rename it to rules.csv at repo root.")
-            else:
-                with st.spinner("Scanning..."):
-                    st.session_state.findings = scan_document(
-                        pages_data=pages_data,
-                        model_name=model,
-                        rules_by_phrase=rules_by_phrase,
-                        trigger_phrases=trigger_phrases
-                    )
-                    st.session_state.selected_phrase = None
-                    st.session_state.selected_page = None
-                    st.session_state.selected_uid = None
+    if uploaded_file is not None and pages_text_by_num:
+        if st.button("Run Analysis", type="primary"):
+            with st.spinner("Scanning..."):
+                if rules_ok:
+                    st.session_state.findings = scan_with_rules(pages_text_by_num, rules)
+                else:
+                    st.session_state.findings = []
+                st.session_state.selected_phrase = None
+                st.session_state.selected_uid = None
 
     results = st.session_state.findings
     if results is not None:
@@ -440,22 +373,21 @@ with col2:
             else:
                 for idx, item in enumerate(results):
                     uid = item["uid"]
-
-                    # checkbox state
-                    done_key = f"done_{uid}"
-                    if done_key not in st.session_state:
-                        st.session_state[done_key] = bool(st.session_state.done_map.get(uid, False))
-
-                    # Selected button styling
                     is_selected = (st.session_state.selected_uid == uid)
 
-                    # Row layout: checkbox + button
-                    cbox_col, btn_col = st.columns([0.12, 0.88], vertical_alignment="center")
-                    with cbox_col:
-                        new_done = st.checkbox(" ", key=done_key)
-                        st.session_state.done_map[uid] = bool(new_done)
+                    done_key = f"done_{uid}"
+                    if done_key not in st.session_state.done_map:
+                        st.session_state.done_map[done_key] = False
 
-                    with btn_col:
+                    top_cols = st.columns([0.14, 0.86])
+                    with top_cols[0]:
+                        st.session_state.done_map[done_key] = st.checkbox(
+                            "",
+                            value=st.session_state.done_map[done_key],
+                            key=f"chk_{uid}"
+                        )
+
+                    with top_cols[1]:
                         btn_label = f'Page {item["page"]} | "{item["phrase"]}"'
                         if st.button(
                             btn_label,
@@ -467,12 +399,12 @@ with col2:
                             st.session_state.selected_page = int(item["page"])
                             st.session_state.selected_phrase = item["phrase"]
 
-                    # Card details (NO confidence/suppression shown)
-                    st.caption(f'Tag: {item.get("category_tag","")}')
-                    st.caption(f'Section: {item.get("target_section","")}')
-                    st.caption(f'Risk: {item.get("risk_explanation","")}')
-                    st.caption(f'Impact: {item.get("builder_impact","")}')
-                    st.caption(f'Question: {item.get("clarification_question","")}')
+                    # Card details (NO confidence/suppression)
+                    st.caption(f'Tag: {item["category_tag"]}')
+                    st.caption(f'Section: {item["target_section"]}')
+                    st.caption(f'Risk: {item["risk_explanation"]}')
+                    st.caption(f'Impact: {item["builder_impact"]}')
+                    st.caption(f'Question: {item["clarification_question"]}')
                     st.divider()
     else:
         st.write("Upload a document to begin.")
