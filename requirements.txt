@@ -3,3 +3,6 @@ pdfplumber
 openai
 pydantic
 pandas
+pypdfium2
+pytesseract
+pillow
