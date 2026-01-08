@@ -1,24 +1,20 @@
 import streamlit as st
 import pdfplumber
+import google.generativeai as genai
 import json
 import re
-import html
-from openai import OpenAI
 
-# ------------------------------------------------------------
-# CONFIG
-# ------------------------------------------------------------
+# --- CONFIGURATION ---
 st.set_page_config(layout="wide", page_title="Prephase Scope Auditor")
 
-if "OPENAI_API_KEY" not in st.secrets:
-    st.error("CRITICAL: Missing OPENAI_API_KEY in Streamlit Secrets.")
+# --- API KEY (Gemini) ---
+if "GOOGLE_API_KEY" in st.secrets:
+    genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
+else:
+    st.error("CRITICAL: Google API Key missing. Add it to Streamlit Secrets.")
     st.stop()
 
-client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-
-# ------------------------------------------------------------
-# SAFE LIBRARY (UNCHANGED BRAIN OUTPUT STYLE)
-# ------------------------------------------------------------
+# --- SAFE LIBRARY (TEMPLATES) ---
 RESPONSE_TEMPLATES = {
     "UNDEFINED_BOUNDARY": {
         "category": "Common Clarification Area",
@@ -62,324 +58,273 @@ RESPONSE_TEMPLATES = {
     }
 }
 
+# --- MODEL PICKER (UNCHANGED DEFAULTS) ---
+def get_best_available_model():
+    try:
+        available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        preferred_order = ["models/gemini-2.5-flash", "models/gemini-1.5-flash", "models/gemini-pro"]
+        for model in preferred_order:
+            if model in available_models:
+                return model
+        return available_models[0] if available_models else "models/gemini-pro"
+    except:
+        return "models/gemini-pro"
+
+# --- BRAIN PROMPT (UNCHANGED) ---
 SYSTEM_INSTRUCTION = """
-ROLE: You are a strict Classifier. You DO NOT write prose. You only select keys.
+ROLE: You are a strict Classifier. You DO NOT write text. You only select keys.
 
 TASK: Analyze the text snippet. Identify specific ambiguities using the KEYS below.
 
-KEYS:
+KEYS (Select the best fit):
 1. UNDEFINED_BOUNDARY (Triggers: "match existing", "tie into", "patch", "repair")
 2. SUBJECTIVE_QUALITY (Triggers: "industry standard", "workmanlike", "satisfaction of")
 3. UNDEFINED_SCOPE (Triggers: "turnkey", "complete system", "including but not limited to")
 4. EXPLICIT_LIABILITY (Triggers: "liquidated damages", "time is of the essence", "indemnify")
 5. COORDINATION_GAP (Triggers: "coordinate with", "verify in field", "by others")
-6. IF_POSSIBLE (Triggers: "if possible", "where possible", "if feasible", "possibly", "potentially")
-7. AS_NEEDED (Triggers: "as needed", "as required", "as necessary", "if needed")
-8. REQUIRED_UPGRADES (Triggers: "required upgrades", "bring to code", "code upgrades", "upgrade")
+6. IF_POSSIBLE (Triggers: "if possible", "where possible", "if feasible")
+7. AS_NEEDED (Triggers: "as needed", "as required", "as necessary")
+8. REQUIRED_UPGRADES (Triggers: "required upgrades", "bring to code", "code upgrades")
 
 CONSTRAINTS:
 - Return ONLY a raw JSON list.
-- Extract the EXACT quote from the provided text.
+- Extract the EXACT quote from the snippet.
 - Do NOT provide reasoning. Only provide the "classification" KEY.
+- IGNORE performance verbs like "optimize", "maximize", "ensure".
 - Return [] if nothing found.
 
 OUTPUT FORMAT:
 [{"trigger_text": "...", "classification": "UNDEFINED_BOUNDARY"}]
 """
 
-# ------------------------------------------------------------
-# TEXT HELPERS
-# ------------------------------------------------------------
-def normalize_text(t: str) -> str:
-    if not t:
-        return ""
-    t = t.lower().strip()
-    t = re.sub(r"\s+", " ", t)
-    return t
+# --- UTILITIES ---
+def clean_json_text(text):
+    text = re.sub(r'```json\s*', '', text)
+    text = re.sub(r'```', '', text)
+    return text.strip()
 
-def spacing_fix(t: str) -> str:
-    """
-    Best-effort spacing repair for pdfplumber word-joins.
-    Keep conservative. Do not rewrite content, only add spaces in obvious joins.
-    """
-    if not t:
-        return ""
-    t = re.sub(r"\s+", " ", t)
-
-    # lowerCaseUpperCase
-    t = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", t)
-    # letterDigit and digitLetter
-    t = re.sub(r"(?<=[A-Za-z])(?=[0-9])", " ", t)
-    t = re.sub(r"(?<=[0-9])(?=[A-Za-z])", " ", t)
-    # punctuationNextLetter
-    t = re.sub(r"(?<=[,.;:])(?=[A-Za-z])", " ", t)
-    # missing space after period when next char is letter
-    t = re.sub(r"(?<=[.])(?=[A-Za-z])", " ", t)
-
-    return t.strip()
-
-def split_text_into_chunks(text: str, max_chars: int = 2200) -> list[str]:
-    """
-    Chunking prevents truncation and reduces missed hits.
-    """
-    text = text.strip()
+def normalize_text(text):
     if not text:
-        return []
+        return ""
+    return re.sub(r'\s+', ' ', text.strip().lower())
 
-    paras = re.split(r"\n\s*\n", text)
+def split_text_into_chunks(text, max_chars=2000):
     chunks = []
-    cur = ""
+    current_chunk = ""
+    paragraphs = text.split('\n\n')
 
-    for p in paras:
-        p = p.strip()
-        if not p:
-            continue
-
-        add = (p + "\n\n")
-        if len(cur) + len(add) <= max_chars:
-            cur += add
+    for para in paragraphs:
+        if len(current_chunk) + len(para) < max_chars:
+            current_chunk += para + "\n\n"
         else:
-            if cur.strip():
-                chunks.append(cur.strip())
-            cur = add
+            if current_chunk:
+                chunks.append(current_chunk)
+            current_chunk = para + "\n\n"
 
-    if cur.strip():
-        chunks.append(cur.strip())
+    if current_chunk:
+        chunks.append(current_chunk)
 
     return chunks
 
-# ------------------------------------------------------------
-# LLM CALL (UNCHANGED "BRAIN", SWAPPED PROVIDER)
-# ------------------------------------------------------------
-def classify_chunk(model_name: str, chunk: str) -> list[dict]:
-    prompt = f"{SYSTEM_INSTRUCTION}\n\nTEXT TO ANALYZE:\n{chunk}"
-    resp = client.responses.create(
-        model=model_name,
-        input=prompt,
-        temperature=0
-    )
-    raw = (resp.output_text or "").strip()
-
-    # Strip code fences if present
-    raw = re.sub(r"```json\s*", "", raw)
-    raw = re.sub(r"```", "", raw).strip()
-
-    try:
-        data = json.loads(raw)
-        if isinstance(data, dict):
-            data = [data]
-        if isinstance(data, list):
-            return data
-    except Exception:
-        return []
-
-    return []
-
-def scan_document(pages_data: list[dict], model_name: str) -> list[dict]:
+# --- SCAN ENGINE (UNCHANGED LOGIC; UI STATE ADDED) ---
+def scan_document(pages_data, model_name):
     findings = []
-    seen = set()
+    seen_hashes = set()
 
-    progress = st.progress(0)
+    model = genai.GenerativeModel(model_name)
+
     total_pages = len(pages_data)
+    progress_bar = st.progress(0)
 
-    for i, p in enumerate(pages_data):
-        page_num = p["page"]
-        page_text = p["text"]
+    for i, page_obj in enumerate(pages_data):
+        page_num = page_obj["page"]
+        raw_text = page_obj["text"]
+        progress_bar.progress((i + 1) / total_pages)
 
-        chunks = split_text_into_chunks(page_text)
+        chunks = split_text_into_chunks(raw_text)
+
         for chunk in chunks:
-            if len(chunk) < 10:
+            if len(chunk.strip()) < 10:
                 continue
 
-            data = classify_chunk(model_name, chunk)
+            try:
+                full_prompt = f"{SYSTEM_INSTRUCTION}\n\nTEXT TO ANALYZE:\n{chunk}"
+                response = model.generate_content(full_prompt)
 
-            for item in data:
-                key = item.get("classification", "")
-                quote = item.get("trigger_text", "")
-
-                if not key or not quote:
+                try:
+                    data = json.loads(clean_json_text(response.text))
+                except:
                     continue
 
-                if key not in RESPONSE_TEMPLATES:
+                if not data:
                     continue
 
-                # Trust anchor: quote must exist in chunk
-                if normalize_text(quote) not in normalize_text(chunk):
-                    continue
+                for item in data:
+                    key = item.get("classification")
+                    quote = item.get("trigger_text")
 
-                uid = f"{page_num}|{normalize_text(quote)}|{key}"
-                if uid in seen:
-                    continue
-                seen.add(uid)
+                    if not quote or not key:
+                        continue
 
-                t = RESPONSE_TEMPLATES[key]
-                findings.append({
-                    "phrase": quote,
-                    "category": t["category"],
-                    "gap": t["gap"],
-                    "question": t["question"],
-                    "page": page_num
-                })
+                    # Trust anchor
+                    norm_quote = normalize_text(quote)
+                    norm_chunk = normalize_text(chunk)
+                    if norm_quote not in norm_chunk:
+                        continue
 
-        progress.progress((i + 1) / max(total_pages, 1))
+                    unique_id = f"{page_num}-{norm_quote}-{key}"
+                    if unique_id in seen_hashes:
+                        continue
 
-    progress.empty()
+                    if key in RESPONSE_TEMPLATES:
+                        t = RESPONSE_TEMPLATES[key]
+                        seen_hashes.add(unique_id)
+                        findings.append({
+                            "id": unique_id,
+                            "phrase": quote,
+                            "category": t["category"],
+                            "gap": t["gap"],
+                            "question": t["question"],
+                            "page": page_num
+                        })
 
-    findings.sort(key=lambda x: (x["page"], x["category"], len(x["phrase"])))
+            except Exception:
+                continue
+
+    progress_bar.empty()
     return findings
 
-# ------------------------------------------------------------
-# UI: Page Viewer with jump-to-highlight
-# ------------------------------------------------------------
-def render_page_with_highlight(page_text: str, highlight_phrase: str | None):
-    """
-    Renders a scrollable div. If highlight_phrase is present, highlights first occurrence and scrolls to it.
-    """
-    safe_text = html.escape(page_text)
-
-    # Default: no highlight
-    if not highlight_phrase:
-        html_block = f"""
-        <div id="pageBox" style="height: 520px; overflow-y: auto; padding: 14px; border: 1px solid rgba(255,255,255,0.12); border-radius: 10px; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size: 13px; line-height: 1.45;">
-        {safe_text}
-        </div>
-        """
-        st.components.v1.html(html_block, height=560)
-        return
-
-    # Highlight first occurrence (case-insensitive) while preserving original escaping
-    phrase_esc = html.escape(highlight_phrase)
-    pattern = re.compile(re.escape(phrase_esc), re.IGNORECASE)
-
-    match = pattern.search(safe_text)
-    if not match:
-        # If we cannot find it, still render text
-        html_block = f"""
-        <div id="pageBox" style="height: 520px; overflow-y: auto; padding: 14px; border: 1px solid rgba(255,255,255,0.12); border-radius: 10px; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size: 13px; line-height: 1.45;">
-        {safe_text}
-        </div>
-        """
-        st.components.v1.html(html_block, height=560)
-        return
-
-    start, end = match.span()
-    before = safe_text[:start]
-    mid = safe_text[start:end]
-    after = safe_text[end:]
-
-    highlighted = before + '<mark id="hit" style="background: #f2d34f; padding: 0 2px; border-radius: 3px;">' + mid + "</mark>" + after
-
-    html_block = f"""
-    <div id="pageBox" style="height: 520px; overflow-y: auto; padding: 14px; border: 1px solid rgba(255,255,255,0.12); border-radius: 10px; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size: 13px; line-height: 1.45;">
-    {highlighted}
-    </div>
-
-    <script>
-      const box = document.getElementById("pageBox");
-      const hit = document.getElementById("hit");
-      if (box && hit) {{
-        const top = hit.offsetTop - 80;
-        box.scrollTo({{ top: top, behavior: "smooth" }});
-      }}
-    </script>
-    """
-    st.components.v1.html(html_block, height=560)
-
-# ------------------------------------------------------------
-# APP
-# ------------------------------------------------------------
-st.title("Prephase Scope Auditor")
-st.markdown("**Ethos:** Neutral identification of undefined scope conditions. The burden moves from people to paper.")
-st.divider()
-
-# State
+# --- SESSION STATE ---
 if "findings" not in st.session_state:
     st.session_state.findings = None
-if "selected_page" not in st.session_state:
-    st.session_state.selected_page = 1
-if "selected_phrase" not in st.session_state:
-    st.session_state.selected_phrase = None
 
-col1, col2 = st.columns([1.6, 1.0])
+if "active_finding" not in st.session_state:
+    st.session_state.active_finding = None
 
-with col1:
+if "reviewed_map" not in st.session_state:
+    st.session_state.reviewed_map = {}  # finding_id -> bool
+
+# --- UI ---
+st.title("Prephase Scope Auditor")
+st.markdown("**Ethos:** Move the burden from the person to the document.")
+st.divider()
+
+# Controls row (model + scan)
+controls_left, controls_right = st.columns([1.2, 1])
+
+with controls_left:
     st.subheader("1. Source Document")
     uploaded_file = st.file_uploader("Upload Scope PDF", type="pdf")
 
-    pages_data = []
-    pages_text_by_num = {}
-
-    if uploaded_file is not None:
-        with pdfplumber.open(uploaded_file) as pdf:
-            for i, page in enumerate(pdf.pages):
-                words = page.extract_words(x_tolerance=1)
-                text = " ".join([w["text"] for w in words])
-                text = spacing_fix(text)
-
-                if text.strip():
-                    page_num = i + 1
-                    pages_data.append({"page": page_num, "text": text})
-                    pages_text_by_num[page_num] = text
-
-        if pages_data:
-            st.caption("Click a finding on the right to jump and highlight it here.")
-
-            max_page = max(pages_text_by_num.keys())
-            # keep selected_page in range
-            st.session_state.selected_page = max(1, min(st.session_state.selected_page, max_page))
-
-            page_choice = st.number_input(
-                "Page",
-                min_value=1,
-                max_value=max_page,
-                value=int(st.session_state.selected_page),
-                step=1
-            )
-            st.session_state.selected_page = int(page_choice)
-
-            current_text = pages_text_by_num.get(st.session_state.selected_page, "")
-            render_page_with_highlight(current_text, st.session_state.selected_phrase)
-        else:
-            st.warning("No readable text was extracted from this PDF.")
-
-with col2:
-    st.subheader("2. Findings")
-
-    model = st.selectbox(
+with controls_right:
+    st.subheader("2. Run Analysis")
+    default_model = get_best_available_model()
+    model_name = st.selectbox(
         "Model",
-        options=[
-            "gpt-4o-mini",
-            "gpt-4o",
-            "gpt-4.1"
-        ],
-        index=0,
-        help="Start with gpt-4o-mini for cost + speed. Use gpt-4.1 if you want stricter extraction behavior."
+        options=[default_model, "models/gemini-2.5-flash", "models/gemini-1.5-flash", "models/gemini-pro"],
+        index=0
     )
 
+pages_data = []
+full_text_display = ""
+
+if uploaded_file is not None:
+    with pdfplumber.open(uploaded_file) as pdf:
+        for i, page in enumerate(pdf.pages):
+            # Your current extraction approach (kept)
+            words = page.extract_words(x_tolerance=1)
+            page_text = " ".join([w["text"] for w in words])
+            page_text = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', page_text)
+
+            if page_text:
+                pages_data.append({"page": i + 1, "text": page_text})
+
+# Two-column main layout (PDF left, findings right)
+col_left, col_right = st.columns([1.6, 1])
+
+with col_right:
     if pages_data:
-        if st.button("Run Analysis", type="primary"):
-            with st.spinner("Scanning..."):
-                st.session_state.findings = scan_document(pages_data, model_name=model)
-                st.session_state.selected_phrase = None
+        if st.button("Run Audit"):
+            with st.spinner("Applying filters..."):
+                st.session_state.findings = scan_document(pages_data, model_name)
 
-    results = st.session_state.findings
-    if results is not None:
-        st.info(f"Scan complete. Found {len(results)} items.")
+                # Initialize reviewed map for new findings (do not wipe existing checked items if IDs match)
+                for f in (st.session_state.findings or []):
+                    st.session_state.reviewed_map.setdefault(f["id"], False)
 
-        # Fixed-height findings column with internal scroll
-        # NOTE: If you are on an older Streamlit version that errors here, upgrade Streamlit.
-        with st.container(height=560, border=True):
-            if len(results) == 0:
-                st.write("No findings.")
-            else:
-                for idx, item in enumerate(results):
-                    btn_label = f'{item["category"]} | Page {item["page"]} | "{item["phrase"]}"'
-                    if st.button(btn_label, key=f"pick_{idx}"):
-                        st.session_state.selected_page = int(item["page"])
-                        st.session_state.selected_phrase = item["phrase"]
+                # Reset active selection on new scan
+                st.session_state.active_finding = None
 
-                    st.caption(f'Gap: {item["gap"]}')
-                    st.caption(f'Clarification: {item["question"]}')
-                    st.divider()
+# LEFT: Extracted text with highlight of active finding
+with col_left:
+    st.subheader("Extracted Text")
+
+    if pages_data:
+        highlighted_text = ""
+
+        active = st.session_state.active_finding
+        active_phrase = active["phrase"] if active else None
+        active_page = active["page"] if active else None
+
+        for page in pages_data:
+            page_header = f"\n\n--- Page {page['page']} ---\n"
+            page_text = page["text"]
+
+            if active_phrase and page["page"] == active_page and active_phrase in page_text:
+                # Simple, readable highlight marker
+                page_text = page_text.replace(active_phrase, f"🔶 {active_phrase} 🔶")
+
+            highlighted_text += page_header + page_text
+
+        st.text_area("PDF Text", highlighted_text, height=750)
+    else:
+        st.info("Upload a PDF to see extracted text.")
+
+# RIGHT: Findings panel fixed height with internal scroll + checkboxes
+with col_right:
+    st.subheader("Findings")
+
+    results = st.session_state.findings or []
+    if results:
+        reviewed_count = sum(1 for f in results if st.session_state.reviewed_map.get(f["id"], False))
+        remaining = len(results) - reviewed_count
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total", len(results))
+        m2.metric("Reviewed", reviewed_count)
+        m3.metric("Remaining", remaining)
+
+        show_reviewed_only = st.checkbox("Show reviewed only", value=False)
+
+        with st.container(height=750):
+            for idx, item in enumerate(results):
+                fid = item["id"]
+                is_reviewed = st.session_state.reviewed_map.get(fid, False)
+
+                if show_reviewed_only and not is_reviewed:
+                    continue
+
+                # Click target (sets active finding)
+                if st.button(
+                    f"{item['category']}  •  Page {item['page']}",
+                    key=f"select_{fid}"
+                ):
+                    st.session_state.active_finding = item
+
+                # Checkbox (reviewed state)
+                checked = st.checkbox(
+                    "Reviewed",
+                    value=is_reviewed,
+                    key=f"review_{fid}"
+                )
+                st.session_state.reviewed_map[fid] = checked
+
+                st.caption(f"**Found:** “{item['phrase']}”")
+                st.markdown(f"**Gap:** {item['gap']}")
+                st.markdown(f"**Clarification:** {item['question']}")
+                st.divider()
+
+    elif pages_data:
+        st.write("Run the audit to see findings.")
     else:
         st.write("Upload a document to begin.")
