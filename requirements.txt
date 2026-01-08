@@ -2,3 +2,4 @@ streamlit
 pdfplumber
 openai
 pydantic
+pandas
