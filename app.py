@@ -19,7 +19,7 @@ from PIL import Image
 # ------------------------------------------------------------
 # CONFIG
 # ------------------------------------------------------------
-st.set_page_config(layout="wide", page_title="Prephase Scope Translator (UI Jump + Scroll)")
+st.set_page_config(layout="wide", page_title="Prephase Scope Auditor")
 
 if "OPENAI_API_KEY" not in st.secrets:
     st.error("CRITICAL: Missing OPENAI_API_KEY in Streamlit Secrets.")
