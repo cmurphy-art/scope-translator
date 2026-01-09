@@ -287,8 +287,8 @@ def render_page_with_highlight(page_text: str, highlight_phrase: Optional[str]):
 # ------------------------------------------------------------
 # APP
 # ------------------------------------------------------------
-st.title("Scope Translator")
-st.markdown("**Ethos:** Move the burden from the person to the document.")
+st.title("Scope Auditor")
+st.markdown("Move the burden from the person to the document.")
 st.divider()
 
 # State
