@@ -21,7 +21,7 @@ from PIL import Image
 # CONFIG
 # ------------------------------------------------------------
 st.set_page_config(layout="wide", page_title="Prephase Scope Auditor")
-st.caption("BUILD: 2026-01-09 B (scroll viewer only)")
+
 
 if "OPENAI_API_KEY" not in st.secrets:
     st.error("CRITICAL: Missing OPENAI_API_KEY in Streamlit Secrets.")
