@@ -16,11 +16,12 @@ import pytesseract
 import pypdfium2 as pdfium
 from PIL import Image
 
+
 # ------------------------------------------------------------
 # CONFIG
 # ------------------------------------------------------------
 st.set_page_config(layout="wide", page_title="Prephase Scope Auditor")
-st.caption("BUILD: 2026-01-09 A (scroll viewer)")
+st.caption("BUILD: 2026-01-09 B (scroll viewer only)")
 
 if "OPENAI_API_KEY" not in st.secrets:
     st.error("CRITICAL: Missing OPENAI_API_KEY in Streamlit Secrets.")
@@ -29,6 +30,7 @@ if "OPENAI_API_KEY" not in st.secrets:
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])  # do not change
 
 RULES_FILENAME = "rules.csv"
+
 
 # ------------------------------------------------------------
 # TEXT HELPERS
@@ -39,6 +41,7 @@ def normalize_text(t: str) -> str:
     t = t.lower().strip()
     t = re.sub(r"\s+", " ", t)
     return t
+
 
 def spacing_fix(t: str) -> str:
     """Conservative spacing repair for pdf word-joins."""
@@ -58,8 +61,10 @@ def spacing_fix(t: str) -> str:
 
     return t.strip()
 
+
 def file_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
 
 # ------------------------------------------------------------
 # RULES LOADING (BRAIN)
@@ -74,6 +79,7 @@ class Rule:
     clarification_question: str
     confidence_requirement: str
     suppression_rule: str
+
 
 def load_rules_csv(path: str) -> List[Rule]:
     rules: List[Rule] = []
@@ -91,7 +97,7 @@ def load_rules_csv(path: str) -> List[Rule]:
                 "suppression_rule",
             ]
             for c in required_cols:
-                if c not in reader.fieldnames:
+                if c not in (reader.fieldnames or []):
                     raise ValueError(f"Missing column in rules.csv: {c}")
 
             for row in reader:
@@ -116,12 +122,14 @@ def load_rules_csv(path: str) -> List[Rule]:
         return []
     return rules
 
+
 # ------------------------------------------------------------
 # OCR FALLBACK (BRAIN-SIDE ONLY)
 # ------------------------------------------------------------
 def ocr_available() -> bool:
     # pytesseract needs the system "tesseract" binary
     return shutil.which("tesseract") is not None
+
 
 @st.cache_data(show_spinner=False)
 def ocr_page_text(pdf_bytes: bytes, page_index: int) -> str:
@@ -131,11 +139,11 @@ def ocr_page_text(pdf_bytes: bytes, page_index: int) -> str:
     """
     doc = pdfium.PdfDocument(pdf_bytes)
     page = doc.get_page(page_index)
-    # Render at higher scale for better OCR
-    bitmap = page.render(scale=2.0)
+    bitmap = page.render(scale=2.0)  # higher scale for better OCR
     pil_image = bitmap.to_pil()
     text = pytesseract.image_to_string(pil_image, lang="eng")
     return spacing_fix(text)
+
 
 def extract_pages_text(uploaded_pdf_bytes: bytes) -> Dict[int, str]:
     """
@@ -151,12 +159,9 @@ def extract_pages_text(uploaded_pdf_bytes: bytes) -> Dict[int, str]:
             words = page.extract_words(x_tolerance=1) or []
             text = " ".join([w.get("text", "") for w in words]).strip()
             text = spacing_fix(text)
+            pages_text[i + 1] = text
 
-            page_num = i + 1
-            pages_text[page_num] = text
-
-    # 2) OCR fallback (only for empty/near-empty pages)
-    # Keep threshold conservative so we don't OCR normal text PDFs.
+    # 2) OCR fallback for empty/near-empty pages
     needs_ocr = [p for p, t in pages_text.items() if len((t or "").strip()) < 20]
 
     if needs_ocr:
@@ -168,15 +173,14 @@ def extract_pages_text(uploaded_pdf_bytes: bytes) -> Dict[int, str]:
             )
             return pages_text
 
-        # Run OCR only for pages that need it
         for page_num in needs_ocr:
             idx0 = page_num - 1
             ocr_text = ocr_page_text(uploaded_pdf_bytes, idx0)
-            # Only replace if OCR produced something meaningful
             if len((ocr_text or "").strip()) >= 20:
                 pages_text[page_num] = ocr_text
 
     return pages_text
+
 
 # ------------------------------------------------------------
 # SCANNING (RULES ENGINE)
@@ -199,7 +203,6 @@ def scan_with_rules(pages_text_by_num: Dict[int, str], rules: List[Rule]) -> Lis
             if not phrase:
                 continue
 
-            # Case-insensitive literal search
             pattern = re.compile(re.escape(phrase), re.IGNORECASE)
             for m in pattern.finditer(page_text):
                 hit = m.group(0)
@@ -217,7 +220,7 @@ def scan_with_rules(pages_text_by_num: Dict[int, str], rules: List[Rule]) -> Lis
                         "risk_explanation": r.risk_explanation,
                         "builder_impact": r.builder_impact,
                         "clarification_question": r.clarification_question,
-                        # keep these in data (brain), but DO NOT display on cards:
+                        # Keep these in data (brain), but do not display on cards
                         "confidence_requirement": r.confidence_requirement,
                         "suppression_rule": r.suppression_rule,
                         "page": page_num,
@@ -230,60 +233,76 @@ def scan_with_rules(pages_text_by_num: Dict[int, str], rules: List[Rule]) -> Lis
     findings.sort(key=lambda x: (x["page"], x["category_tag"], len(x["phrase"])))
     return findings
 
+
 # ------------------------------------------------------------
-# UI: Page Viewer with jump-to-highlight (UNCHANGED)
+# UI: Scroll Viewer (NO +/- EVER)
 # ------------------------------------------------------------
-def render_page_with_highlight(page_text: str, highlight_phrase: Optional[str]):
+def render_full_doc_with_highlight(
+    pages_text_by_num: Dict[int, str],
+    highlight_phrase: Optional[str],
+    highlight_page: Optional[int],
+):
     """
-    Renders a scrollable div. If highlight_phrase is present, highlights first occurrence and scrolls to it.
+    Renders the entire document in one scrollable div with page anchors.
+    If highlight_phrase is present, highlights first occurrence on highlight_page and scrolls to it.
+    If no highlight is found, scrolls to the page anchor.
     """
-    safe_text = html.escape(page_text or "")
+    parts: List[str] = []
 
-    # Default: no highlight
-    if not highlight_phrase:
-        html_block = f"""
-        <div id="pageBox" style="height: 520px; overflow-y: auto; padding: 14px; border: 1px solid rgba(255,255,255,0.12); border-radius: 10px; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size: 13px; line-height: 1.45;">
-        {safe_text}
-        </div>
-        """
-        st.components.v1.html(html_block, height=560)
-        return
+    for p in sorted(pages_text_by_num.keys()):
+        page_text = pages_text_by_num.get(p, "") or ""
+        safe_text = html.escape(page_text)
 
-    phrase_esc = html.escape(highlight_phrase)
-    pattern = re.compile(re.escape(phrase_esc), re.IGNORECASE)
+        parts.append(
+            f'<div id="page_{p}" style="margin: 0 0 10px 0; opacity: 0.75; font-size: 12px;">Page {p}</div>'
+        )
 
-    match = pattern.search(safe_text)
-    if not match:
-        html_block = f"""
-        <div id="pageBox" style="height: 520px; overflow-y: auto; padding: 14px; border: 1px solid rgba(255,255,255,0.12); border-radius: 10px; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size: 13px; line-height: 1.45;">
-        {safe_text}
-        </div>
-        """
-        st.components.v1.html(html_block, height=560)
-        return
+        if highlight_phrase and highlight_page == p:
+            phrase_esc = html.escape(highlight_phrase)
+            pattern = re.compile(re.escape(phrase_esc), re.IGNORECASE)
+            m = pattern.search(safe_text)
+            if m:
+                start, end = m.span()
+                safe_text = (
+                    safe_text[:start]
+                    + '<mark id="hit" style="background: #f2d34f; padding: 0 2px; border-radius: 3px;">'
+                    + safe_text[start:end]
+                    + "</mark>"
+                    + safe_text[end:]
+                )
 
-    start, end = match.span()
-    before = safe_text[:start]
-    mid = safe_text[start:end]
-    after = safe_text[end:]
+        parts.append(safe_text)
+        parts.append(
+            "<hr style='border: none; border-top: 1px solid rgba(255,255,255,0.10); margin: 14px 0;'/>"
+        )
 
-    highlighted = before + '<mark id="hit" style="background: #f2d34f; padding: 0 2px; border-radius: 3px;">' + mid + "</mark>" + after
+    full = "\n".join(parts)
+    jump_page = int(highlight_page or 1)
 
     html_block = f"""
-    <div id="pageBox" style="height: 520px; overflow-y: auto; padding: 14px; border: 1px solid rgba(255,255,255,0.12); border-radius: 10px; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size: 13px; line-height: 1.45;">
-    {highlighted}
+    <div id="docBox" style="height: 520px; overflow-y: auto; padding: 14px; border: 1px solid rgba(255,255,255,0.12);
+         border-radius: 10px; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+         'Liberation Mono', 'Courier New', monospace; font-size: 13px; line-height: 1.45;">
+      {full}
     </div>
 
     <script>
-      const box = document.getElementById("pageBox");
+      const box = document.getElementById("docBox");
       const hit = document.getElementById("hit");
-      if (box && hit) {{
-        const top = hit.offsetTop - 80;
-        box.scrollTo({{ top: top, behavior: "smooth" }});
+      const pageAnchor = document.getElementById("page_{jump_page}");
+      if (box) {{
+        if (hit) {{
+          const top = hit.offsetTop - 80;
+          box.scrollTo({{ top: top, behavior: "smooth" }});
+        }} else if (pageAnchor) {{
+          const top = pageAnchor.offsetTop - 20;
+          box.scrollTo({{ top: top, behavior: "smooth" }});
+        }}
       }}
     </script>
     """
     st.components.v1.html(html_block, height=560)
+
 
 # ------------------------------------------------------------
 # APP
@@ -304,6 +323,7 @@ if "selected_uid" not in st.session_state:
 if "done_map" not in st.session_state:
     st.session_state.done_map = {}  # uid -> bool
 
+
 rules = load_rules_csv(RULES_FILENAME)
 rules_ok = len(rules) > 0
 
@@ -323,19 +343,13 @@ with col1:
             st.caption("Click a finding on the right to jump and highlight it here.")
 
             max_page = max(pages_text_by_num.keys())
-            st.session_state.selected_page = max(1, min(st.session_state.selected_page, max_page))
+            st.session_state.selected_page = max(1, min(int(st.session_state.selected_page or 1), max_page))
 
-            page_choice = st.number_input(
-                "Page",
-                min_value=1,
-                max_value=max_page,
-                value=int(st.session_state.selected_page),
-                step=1
+            render_full_doc_with_highlight(
+                pages_text_by_num=pages_text_by_num,
+                highlight_phrase=st.session_state.selected_phrase,
+                highlight_page=st.session_state.selected_page,
             )
-            st.session_state.selected_page = int(page_choice)
-
-            current_text = pages_text_by_num.get(st.session_state.selected_page, "")
-            render_page_with_highlight(current_text, st.session_state.selected_phrase)
         else:
             st.warning("No readable text was extracted from this PDF.")
 
@@ -346,7 +360,7 @@ with col2:
         "Model",
         options=["gpt-4o-mini", "gpt-4o", "gpt-4.1"],
         index=0,
-        help="UI only. The rules engine drives findings; model selection is kept for continuity."
+        help="UI only. The rules engine drives findings; model selection is kept for continuity.",
     )
 
     if not rules_ok:
@@ -363,6 +377,7 @@ with col2:
                     st.session_state.findings = []
                 st.session_state.selected_phrase = None
                 st.session_state.selected_uid = None
+                st.session_state.selected_page = 1
 
     results = st.session_state.findings
     if results is not None:
@@ -372,7 +387,7 @@ with col2:
             if len(results) == 0:
                 st.write("No findings.")
             else:
-                for idx, item in enumerate(results):
+                for item in results:
                     uid = item["uid"]
                     is_selected = (st.session_state.selected_uid == uid)
 
@@ -385,7 +400,7 @@ with col2:
                         st.session_state.done_map[done_key] = st.checkbox(
                             "",
                             value=st.session_state.done_map[done_key],
-                            key=f"chk_{uid}"
+                            key=f"chk_{uid}",
                         )
 
                     with top_cols[1]:
@@ -394,7 +409,7 @@ with col2:
                             btn_label,
                             key=f"pick_{uid}",
                             type="primary" if is_selected else "secondary",
-                            use_container_width=True
+                            use_container_width=True,
                         ):
                             st.session_state.selected_uid = uid
                             st.session_state.selected_page = int(item["page"])
